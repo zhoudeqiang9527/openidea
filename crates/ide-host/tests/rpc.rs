@@ -5,7 +5,7 @@ use ide_host::rpc::{self, ChannelMessage, Dispatcher, EventMessage, Invoke, Serv
 use ide_host::{Host, HostConfig};
 use ide_jsonrpc::{Handler, Peer};
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -214,7 +214,11 @@ async fn serves_projects_files_documents_search_and_runs() {
     .await
     .unwrap();
     assert_eq!(settings["deployment"]["autoUpload"], "always");
-    assert!(std::fs::read_to_string(project.join(".openidea/settings.toml")).unwrap().contains("autoUpload"));
+    let project_root = dunce::canonicalize(&project).unwrap();
+    assert!(std::fs::read_to_string(ide_core::project_dir::path(&project_root, "settings.toml"))
+        .unwrap()
+        .contains("autoUpload"));
+    assert!(!project.join(".openidea").exists());
     invoke(&peer, "vcs_init", json!({ "dir": project })).await.unwrap();
     until("git repository", || project.join(".git").is_dir()).await;
 
@@ -243,9 +247,9 @@ async fn serves_projects_files_documents_search_and_runs() {
     assert!(std::fs::read_to_string(project.join(".git/info/exclude")).unwrap().contains("/private.ignore-me"));
     let outside = tmp.path().join("outside.ignore-me");
     std::fs::write(&outside, "keep").unwrap();
-    assert!(
-        invoke(&peer, "vcs_add_to_ignore", json!({ "paths": [outside], "destination": "gitignore" })).await.is_err()
-    );
+    assert!(invoke(&peer, "vcs_add_to_ignore", json!({ "paths": [outside], "destination": "gitignore" }))
+        .await
+        .is_err());
 
     // Unknown commands and bad arguments come back as IdeErrors.
     let e = invoke(&peer, "window_minimize", json!({})).await.unwrap_err();

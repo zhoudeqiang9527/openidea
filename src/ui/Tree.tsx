@@ -59,6 +59,8 @@ export interface TreeOccurrence {
 
 export interface TreeHandle {
   focus(): void;
+  search(query: string): void;
+  searchNext(dir: 1 | -1): void;
   /** Selects `key` (must be visible, i.e. ancestors expanded) and scrolls to it. */
   reveal(key: string): void;
   leadKey(): string | null;
@@ -109,6 +111,9 @@ export interface TreeProps<T> {
   onContextMenu?: (node: T | null, selection: Set<string>, e: MouseEvent) => void;
 
   speedSearch?: boolean;
+  /** Called when the search text or availability of visible matches changes. */
+  onSpeedSearch?: (query: string, hasMatch: boolean) => void;
+  externalSearchField?: boolean;
   speedSearchMode?: "highlight" | "filter";
   rowHeight?: number;
   indent?: number;
@@ -226,6 +231,7 @@ export function Tree<T>(props: TreeProps<T>) {
     onContextMenu,
     speedSearch = true,
     speedSearchMode = "highlight",
+    onSpeedSearch,
     rowHeight: fixedRowHeight,
     indent = 20,
     className,
@@ -282,6 +288,10 @@ export function Tree<T>(props: TreeProps<T>) {
     }
     return m;
   }, [allRows, query, getLabel]);
+
+  useEffect(() => {
+    onSpeedSearch?.(query, matchMap.size > 0);
+  }, [query, matchMap.size, onSpeedSearch]);
 
   const rows = useMemo(() => {
     if (!query || speedSearchMode !== "filter") return allRows;
@@ -383,6 +393,15 @@ export function Tree<T>(props: TreeProps<T>) {
 
   useImperativeHandle(handleRef, () => ({
     focus: () => scrollRef.current?.focus(),
+    search: (value) => {
+      setQuery(value);
+      const hit = findMatch(leadIndex, 1, true, value);
+      if (hit >= 0) selectIndex(hit);
+    },
+    searchNext: (dir) => {
+      const hit = findMatch(leadIndex, dir, false);
+      if (hit >= 0) selectIndex(hit);
+    },
     reveal: (key: string) => {
       const i = indexOfKey.get(key);
       if (i === undefined) return;
@@ -589,7 +608,7 @@ export function Tree<T>(props: TreeProps<T>) {
         className={styles.tree}
         onKeyDown={onKeyDown}
         onBlur={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setQuery("");
+          if (!props.externalSearchField && !e.currentTarget.contains(e.relatedTarget as Node | null)) setQuery("");
         }}
         onContextMenu={
           onContextMenu
@@ -705,7 +724,7 @@ export function Tree<T>(props: TreeProps<T>) {
           })}
         </div>
       </div>
-      {query && (
+      {query && !props.externalSearchField && (
         <div className={clsx(styles.speedSearch, noMatch && styles.noMatch)} role="status" aria-live="polite">
           <Icon name="search" size={12} />
           <span className={styles.speedQuery}>{query}</span>

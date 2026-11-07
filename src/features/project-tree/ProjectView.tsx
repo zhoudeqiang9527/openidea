@@ -22,7 +22,7 @@ import { revealRange, useEditorRegistry } from "@/editor/api";
 import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { tx, useTxTemplate } from "@/platform/i18n";
-import { isTauri } from "@/platform/ipc";
+import { call, commands, isTauri } from "@/platform/ipc";
 import { nativeDropPoint } from "@/platform/nativeDrop";
 import type { RootFolder } from "@/platform/languageSettings";
 import { useDetectedRoots, useEffectiveRoots } from "@/platform/projectRoots";
@@ -32,7 +32,9 @@ import {
   FILES_DRAG,
   HighlightedText,
   Icon,
+  IconButton,
   Popup,
+  SearchField,
   dragSession,
   Tree,
   acquirePopup,
@@ -47,6 +49,7 @@ import {
   type TreeRowState,
 } from "@/ui";
 import { badgeKind } from "@/ui/symbolKind";
+import { fuzzyMatch } from "@/ui/match";
 import { contextMenuItems, menuGroupContext, newMenuItems } from "./contextMenu";
 import { openNewPopup } from "./newPopupModel";
 import { presentationIcon, useJvmPresentation } from "@/platform/filePresentation";
@@ -420,6 +423,36 @@ export function ProjectView() {
   const options = useProjectTree((s) => s.options);
   const home = useHomeDir((s) => s.home);
   const handle = useRef<TreeHandle | null>(null);
+  const searchGeneration = useRef(0);
+  const [searchText, setSearchText] = useState("");
+  const searchReveal = useRef<{ query: string; seq: number } | null>(null);
+  const onSpeedSearch = useCallback((query: string, hasMatch: boolean) => {
+    setSearchText(query);
+    const generation = ++searchGeneration.current;
+    if (searchReveal.current && searchReveal.current.query !== query) {
+      clearRevealRequest(searchReveal.current.seq);
+      searchReveal.current = null;
+    }
+    if (!query.trim() || hasMatch) return;
+    void call(commands.findFiles(query, 50))
+      .then((files) => {
+        if (generation !== searchGeneration.current) return;
+        const candidates = files.filter((file) => fuzzyMatch(nameOf(String(file.path)), query));
+        const match =
+          candidates.find((file) => nameOf(String(file.path)).toLowerCase() === query.toLowerCase()) ?? candidates[0];
+        if (match && revealPath(String(match.path))) {
+          const request = useProjectTree.getState().revealRequest;
+          if (request) searchReveal.current = { query, seq: request.seq };
+        }
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(
+    () => () => {
+      searchGeneration.current++;
+    },
+    [],
+  );
   const containerRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const revealing = useRef(false);
@@ -782,6 +815,51 @@ export function ProjectView() {
       onFocus={(e) => setContext("projectViewFocus", (e.target as HTMLElement).getAttribute("role") === "tree")}
       onBlur={() => setContext("projectViewFocus", false)}
     >
+      <div className={styles.search}>
+        <SearchField
+          aria-label={tx`Search project files`}
+          placeholder={tx`Search project files`}
+          value={searchText}
+          trailing={
+            <>
+              <IconButton
+                icon="chevron-up"
+                title="Previous match"
+                size="small"
+                disabled={!searchText.trim()}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => handle.current?.searchNext(-1)}
+              />
+              <IconButton
+                icon="chevron-down"
+                title="Next match"
+                size="small"
+                disabled={!searchText.trim()}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => handle.current?.searchNext(1)}
+              />
+            </>
+          }
+          onChange={(value) => {
+            setSearchText(value);
+            handle.current?.search(value);
+          }}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Escape") {
+              setSearchText("");
+              handle.current?.search("");
+              e.preventDefault();
+            } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+              handle.current?.searchNext(e.key === "ArrowDown" ? 1 : -1);
+              e.preventDefault();
+            } else if (e.key === "Enter") {
+              openSelection();
+              e.preventDefault();
+            }
+          }}
+        />
+      </div>
       {mode === "unity" && unity && !unity.projects.length && (
         <div className={styles.unityNotice} role="status">
           {tx`C# project files are missing. In Unity, select an external script editor in Preferences > External Tools, then regenerate project files.`}
@@ -796,6 +874,8 @@ export function ProjectView() {
         horizontalScroll
         aria-label="Project"
         handleRef={setTreeHandle}
+        externalSearchField
+        onSpeedSearch={onSpeedSearch}
         roots={model.roots}
         getKey={getKey}
         getLabel={getLabel}

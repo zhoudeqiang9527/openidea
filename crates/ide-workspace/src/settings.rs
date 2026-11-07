@@ -1,5 +1,5 @@
 use ide_core::settings::Settings;
-use ide_core::{IdeError, IdeResult, project_dir};
+use ide_core::{project_dir, IdeError, IdeResult};
 use parking_lot::RwLock;
 use serde_json::Value as Json;
 use std::collections::BTreeMap;
@@ -17,6 +17,7 @@ const PROJECT_FILE: &str = "settings.toml";
 pub struct SettingsStore {
     global_file: PathBuf,
     project_file: Option<PathBuf>,
+    project_root: Option<PathBuf>,
     effective: RwLock<Settings>,
 }
 
@@ -162,6 +163,7 @@ impl SettingsStore {
         let store = Self {
             global_file: config_dir.join("settings.toml"),
             project_file: project_root.map(|r| project_dir::path(r, PROJECT_FILE)),
+            project_root: project_root.map(Path::to_path_buf),
             effective: RwLock::new(Settings::default()),
         };
         store.reload();
@@ -194,7 +196,7 @@ impl SettingsStore {
             }
         }
         let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
-        if let Some(root) = self.project_file.as_deref().and_then(Path::parent).and_then(Path::parent)
+        if let Some(root) = self.project_root.as_deref()
             && let Ok(Some(workspace)) = crate::workspace::Workspace::load(root)
         {
             settings.general.project_name = workspace.name;
@@ -350,11 +352,9 @@ mod tests {
         assert_eq!(loaded.editor.color_scheme, "custom-forest");
         assert_eq!(serde_json::to_value(&loaded.editor.custom_schemes).unwrap(), schemes);
         assert!(store.set(SettingsScope::Project, "editor.customSchemes", schemes.clone()).is_err());
-        assert!(
-            store
-                .set(SettingsScope::Project, "editor.customSchemes.custom-other", schemes["custom-forest"].clone())
-                .is_err()
-        );
+        assert!(store
+            .set(SettingsScope::Project, "editor.customSchemes.custom-other", schemes["custom-forest"].clone())
+            .is_err());
         assert!(store.set(SettingsScope::Project, "editor", json!({"customSchemes": schemes})).is_err());
         std::fs::write(
             proj.join(".openidea/settings.toml"),

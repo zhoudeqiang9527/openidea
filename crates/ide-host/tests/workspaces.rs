@@ -1,10 +1,41 @@
 use ide_core::{ChangeSet, NullSink, RequestId, TextChange};
-use ide_host::{Host, HostConfig, ops};
+use ide_host::{ops, Host, HostConfig};
 use ide_workspace::workspace::Workspace;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_settings_and_git_state_are_stored_outside_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = dunce::canonicalize(tmp.path()).unwrap();
+    let root = base.join("project");
+    std::fs::create_dir(&root).unwrap();
+    let config = base.join("config");
+    let host = Host::new(HostConfig {
+        config_dir: config.clone(),
+        data_dir: base.join("data"),
+        local_data_dir: base.join("data"),
+        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
+        syntax: Arc::default(),
+        sink_for: Box::new(|_| Arc::new(NullSink)),
+        owner: |w| w,
+        runtime: tokio::runtime::Handle::current(),
+        project_environment: false,
+    });
+    let project = host.open_project("main", &root).unwrap();
+    project.settings.set(ide_workspace::SettingsScope::Project, "editor.tabSize", 8.into()).unwrap();
+    ops::vcs::vcs_changelists_save(&host, "main", ide_vcs::ChangelistState::initial()).unwrap();
+    assert!(!root.join(".openidea").exists());
+    assert!(ide_core::project_dir::path(&root, "settings.toml").starts_with(&config));
+    assert!(ide_core::project_dir::path(&root, "changelists.json").is_file());
+    host.close_project("main");
+    let reopened = host.open_project("main", &root).unwrap();
+    assert_eq!(reopened.settings.effective().editor.tab_size, 8);
+    assert!(!root.join(".openidea").exists());
+    host.close_project("main");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linked_projects_share_navigation_but_keep_files_repositories_and_run_directories() {

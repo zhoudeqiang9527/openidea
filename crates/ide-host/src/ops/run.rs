@@ -16,6 +16,7 @@ pub fn configs(host: &Host, window: &str) -> IdeResult<Vec<RunConfig>> {
     let mut all = detected_and_saved(&root, &settings, &user, &root_suppressed);
     if let Some(workspace) = ide_workspace::workspace::Workspace::load(&root)? {
         for member in workspace.projects.into_iter().filter(|p| p.is_dir()) {
+            ide_core::project_dir::register(&host.config_dir, &member)?;
             let settings = ide_workspace::SettingsStore::load(&host.config_dir, Some(&member)).effective();
             let saved = ide_run::load_user_configs(&member)?;
             let suppressed = ide_run::load_suppressed_config_ids(&member)?;
@@ -152,6 +153,7 @@ fn settings_for(
     });
     Ok(match member {
         Some(root) => {
+            ide_core::project_dir::register(&host.config_dir, &root)?;
             let settings = ide_workspace::SettingsStore::load(&host.config_dir, Some(&root)).effective();
             (root, settings)
         }

@@ -14,8 +14,8 @@ use ide_workspace::documents::DocumentObserver;
 use ide_workspace::{DocumentInfo, Documents, FileMoves, LocalHistory, ProjectRoots, SettingsStore, SourceFolder};
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Everything bound to one open project folder.
 pub struct Project {
@@ -81,7 +81,13 @@ impl Host {
         let opening = self.opening(window);
         let _opening = opening.lock();
         // Reject a damaged manifest before replacing the currently open project.
-        ide_workspace::workspace::Workspace::load(&root)?;
+        let workspace = ide_workspace::workspace::Workspace::load(&root)?;
+        ide_core::project_dir::register(&self.config_dir, &root)?;
+        if let Some(workspace) = &workspace {
+            for member in workspace.projects.iter().filter(|p| p.is_dir()) {
+                ide_core::project_dir::register(&self.config_dir, member)?;
+            }
+        }
         // The window reloaded (or asked again) for the project it already has: keep
         // it, with its warm index, language servers and unsaved documents.
         if let Ok(current) = self.project(window)
@@ -1546,12 +1552,10 @@ mod maven_linkage_tests {
         assert_eq!(excluded_poms, vec![std::path::PathBuf::from("a/child/pom.xml"), "a/pom.xml".into()]);
         let configs = ide_run::detect_excluding(tmp.path(), &excluded_poms);
         assert!(configs.iter().any(|c| c.kind == "maven"));
-        assert!(
-            configs
-                .iter()
-                .filter(|c| c.kind == "maven")
-                .all(|c| { c.cwd.as_ref().is_some_and(|dir| dir.as_ref() == std::path::Path::new("b")) })
-        );
+        assert!(configs
+            .iter()
+            .filter(|c| c.kind == "maven")
+            .all(|c| { c.cwd.as_ref().is_some_and(|dir| dir.as_ref() == std::path::Path::new("b")) }));
         let mut server = serde_json::from_value::<ide_language::LanguageServerConfig>(
             serde_json::json!({"name": "jdtls", "command": "jdtls"}),
         )
@@ -1560,9 +1564,11 @@ mod maven_linkage_tests {
         let options = serde_json::to_value(server.initialization_options).unwrap();
         let exclusions = options.pointer("/settings/java/import/exclusions").unwrap().as_array().unwrap();
         assert!(exclusions.contains(&serde_json::json!(tmp.path().join("a").to_string_lossy().replace('\\', "/"))));
-        assert!(
-            exclusions.contains(&serde_json::json!(tmp.path().join("a/child").to_string_lossy().replace('\\', "/")))
-        );
+        assert!(exclusions.contains(&serde_json::json!(tmp
+            .path()
+            .join("a/child")
+            .to_string_lossy()
+            .replace('\\', "/"))));
         let roots = super::linked_roots(tmp.path(), &settings, &detected);
         assert!(roots.roots.iter().any(|r| r.path == "b/src/main/java"));
         assert!(!roots.roots.iter().any(|r| r.path.starts_with("a/")));

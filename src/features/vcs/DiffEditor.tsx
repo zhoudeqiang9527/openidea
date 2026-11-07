@@ -907,6 +907,23 @@ export function DiffEditor({ input, toolbarActions }: { input: EditorInput; tool
       ? hit.view.state.doc.lineAt(hit.view.posAtCoords({ x: e.clientX, y: e.clientY }, false)).number - 1
       : -1;
     const groups = [
+      ...(source
+        ? [
+            [
+              {
+                label: tx`Jump to Source`,
+                run: () => {
+                  if (hit) {
+                    focusedSide.current = hit.side === "left" ? "a" : "b";
+                    const pos = hit.view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
+                    hit.view.dispatch({ selection: { anchor: pos } });
+                  }
+                  jumpToSource();
+                },
+              },
+            ],
+          ]
+        : []),
       ...(hit ? contribs.map((c) => c.contextMenuItems?.({ side: hit.side, line }) ?? []) : []),
       blameItems(pane),
     ].filter((g) => g.length);

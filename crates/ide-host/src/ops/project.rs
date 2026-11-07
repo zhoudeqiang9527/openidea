@@ -1,6 +1,6 @@
 use crate::{Host, Project};
-use ide_core::IdeResult;
 use ide_core::settings::Settings;
+use ide_core::IdeResult;
 use ide_workspace::settings::SettingsScope;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -63,6 +63,12 @@ pub fn roots(host: &Host, window: &str) -> IdeResult<ide_workspace::ProjectRoots
 
 pub fn save_workspace(host: &Host, window: &str, name: &str, paths: Vec<std::path::PathBuf>) -> IdeResult<ProjectInfo> {
     let project = host.project(window)?;
+    for path in &paths {
+        let path = if path.is_absolute() { path.clone() } else { project.root.join(path) };
+        if path.is_dir() {
+            ide_core::project_dir::register(&host.config_dir, &path)?;
+        }
+    }
     ide_workspace::workspace::Workspace::save(&project.root, name, paths, false)?;
     project.settings.reload();
     project.refresh_index_scope();

@@ -39,33 +39,33 @@ pub mod web;
 pub use api::{FileSecretStore, HostWorkspace, PluginWorkspace, SecretStore};
 pub use icons::{map_asset as icon_theme_map_asset, sanitize_svg, svg_prefix as icon_theme_svg_prefix};
 pub use market::{
-    INDEX_FILE as MARKET_INDEX_FILE, MarketPlugin, OFFICIAL_INDEX as OFFICIAL_MARKET_INDEX, OFFICIAL_PUBLISHER,
-    read_url as read_market_url, resolve as resolve_market_href,
+    read_url as read_market_url, resolve as resolve_market_href, MarketPlugin, INDEX_FILE as MARKET_INDEX_FILE,
+    OFFICIAL_INDEX as OFFICIAL_MARKET_INDEX, OFFICIAL_PUBLISHER,
 };
-pub use points::{COMMANDS, CommandDecl, register_builtin_points};
-pub use providers::{ProviderKind, set_editor_providers};
+pub use points::{register_builtin_points, CommandDecl, COMMANDS};
 pub(crate) use providers::{editor_plugin_host, editor_providers as editor_providers_for};
+pub use providers::{set_editor_providers, ProviderKind};
 pub use theme::{ThemeDef, ThemeKind};
 pub use types::*;
 
 use ide_core::{IdeError, IdeResult, LanguageId};
 use ide_extension::ledger::{self, BinaryGrant, Decision, Ledger, Request, Subject};
 use ide_extension::{
-    ActivationEvent, Capability, CapabilityInfo, ContributionIndex, ExtensionRegistry, MANIFEST_FILE, Manifest,
-    Package, UiContribution, UiStore,
+    ActivationEvent, Capability, CapabilityInfo, ContributionIndex, ExtensionRegistry, Manifest, Package,
+    UiContribution, UiStore, MANIFEST_FILE,
 };
 use ide_language::plugin_point::PluginLanguages;
 use ide_language::{LanguageConfig, ProgramPin};
 use ide_plugin::{
-    Actor, ActorError, CANCELLED, CallError, HostApi, Invocation, Limits, PluginEngine, Runtime, RuntimeSetup,
+    Actor, ActorError, CallError, HostApi, Invocation, Limits, PluginEngine, Runtime, RuntimeSetup, CANCELLED,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const STATE_FILE: &str = "state.json";
@@ -576,7 +576,7 @@ impl PluginHost {
             return;
         }
         let _guard = self.lifecycle.lock();
-        let dirs = package_dirs(&ide_core::project_dir::path(root, "plugins"));
+        let dirs = package_dirs(&root.join(DEV_PLUGINS_DIR));
         let stale: Vec<String> = self
             .plugins
             .read()
@@ -1074,7 +1074,11 @@ impl PluginHost {
         let declared = [ui_points::VIEWS, ui_points::CUSTOM_EDITORS]
             .iter()
             .any(|point| self.ui.items(point, Some(id)).iter().any(|i| i.key == view));
-        if declared { Ok(()) } else { Err(IdeError::not_found(format!("plugin {id:?} declares no view {view:?}"))) }
+        if declared {
+            Ok(())
+        } else {
+            Err(IdeError::not_found(format!("plugin {id:?} declares no view {view:?}")))
+        }
     }
 
     /// One call into a plugin's code for the UI: checks it may run (asking

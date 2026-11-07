@@ -375,8 +375,8 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
           <Checkbox
             checked={!config.local}
             onChange={(shared) => update({ local: !shared })}
-            label="Store as project file"
-            aria-label="Store as project file (.openidea/run.toml); otherwise in the workspace (.openidea/run.local.toml)"
+            label="Use project run configuration file"
+            aria-label="Use the project run configuration file; otherwise use the separate local configuration file. Both are stored in application configuration."
           />
         </div>
       )}

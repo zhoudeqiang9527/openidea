@@ -1,4 +1,10 @@
 {
+  "Use project run configuration file": "Use project run configuration file",
+  "Use the project run configuration file; otherwise use the separate local configuration file. Both are stored in application configuration.": "Use the project run configuration file; otherwise use the separate local configuration file. Both are stored in application configuration.",
+  "Saved in the application configuration for this project; overrides the global value.": "Saved in the application configuration for this project; overrides the global value.",
+  "Previous match": "Previous match",
+  "Next match": "Next match",
+  "Search project files": "Search project files",
   "Cannot copy reference": "Cannot copy reference",
   "Connect through:": "Connect through:",
   "Connect through": "Connect through",

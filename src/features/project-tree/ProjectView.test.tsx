@@ -21,6 +21,7 @@ const ipc = vi.hoisted(() => ({
   docOpen: vi.fn(),
   docClose: vi.fn(),
   docOutline: vi.fn(),
+  findFiles: vi.fn(),
 }));
 vi.mock("@/bindings", async (orig) => {
   const real = await orig<typeof import("@/bindings")>();
@@ -49,6 +50,8 @@ let openFile: ReturnType<typeof vi.fn>;
 let dispose: () => void;
 
 beforeEach(() => {
+  ipc.findFiles.mockReset();
+  ipc.findFiles.mockResolvedValue({ status: "ok", data: [] });
   localStorage.clear();
   fs = new MemoryFs(
     {
@@ -95,6 +98,38 @@ function setup() {
 }
 
 describe("ProjectView", () => {
+  it("searches from the project search field and reveals a file in a collapsed folder", async () => {
+    ipc.findFiles.mockResolvedValue(
+      ok([{ path: "/w/acme/src/Util.kt", relPath: "src/Util.kt", score: 1, indices: [] }]),
+    );
+    const { tree } = setup();
+    const search = screen.getByRole("textbox", { name: "Search project files" });
+    fireEvent.change(search, { target: { value: "Util.kt" } });
+    await waitFor(() => expect(within(tree).getByText("Util.kt")).toBeInTheDocument());
+    await waitFor(() => expect(useProjectTree.getState().selected.has("/w/acme/src/Util.kt")).toBe(true));
+    fireEvent.keyDown(search, { key: "Enter" });
+    await waitFor(() => expect(openFile).toHaveBeenCalled());
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(search).toHaveValue("");
+  });
+  it("navigates search matches with the up and down buttons", async () => {
+    fs = new MemoryFs({ "/w/acme/one.md": "x", "/w/acme/two.md": "x" }, ROOT);
+    setProjectFsForTests(fs, ROOT);
+    setup();
+    await screen.findByText("one.md");
+    const search = screen.getByRole("textbox", { name: "Search project files" });
+    const previous = screen.getByRole("button", { name: "Previous match" });
+    const next = screen.getByRole("button", { name: "Next match" });
+    expect(next).toBeDisabled();
+    fireEvent.change(search, { target: { value: ".md" } });
+    await waitFor(() => expect(useProjectTree.getState().selected.has("/w/acme/one.md")).toBe(true));
+    fireEvent.click(next);
+    expect(useProjectTree.getState().selected.has("/w/acme/two.md")).toBe(true);
+    fireEvent.click(previous);
+    expect(useProjectTree.getState().selected.has("/w/acme/one.md")).toBe(true);
+    fireEvent.click(previous);
+    expect(useProjectTree.getState().selected.has("/w/acme/two.md")).toBe(true);
+  });
   it("toggles Unity metadata and generated files independently in the rendered tree", async () => {
     fs = new MemoryFs(
       {

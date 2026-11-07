@@ -6,6 +6,11 @@
   flex-direction: column;
 }
 
+.search {
+  flex: none;
+  padding: 4px 6px;
+}
+
 .unityNotice {
   flex: none;
   padding: 8px 12px;
