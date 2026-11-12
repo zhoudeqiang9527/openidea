@@ -7,6 +7,7 @@
 import { useEditorRegistry } from "@/editor/api";
 import { basename, useProject } from "@/platform/project";
 import { useT } from "@/platform/i18n";
+import { projectLocation } from "@/platform/remote";
 import { ProgressBar } from "@/ui";
 import projectMark from "../../src-tauri/icons/source/openidea-mark.svg";
 import { useDistractionFree } from "./distractionFree";
@@ -75,7 +76,7 @@ export function Workbench() {
   return (
     <div
       className={frame ? `${styles.workbench} ${frame}` : styles.workbench}
-      style={project ? projectColorVars(project.name) : undefined}
+      style={project ? projectColorVars(projectLocation(project.root) ?? project.root) : undefined}
     >
       <div className={styles.content} inert={openingPath !== null} aria-hidden={openingPath ? true : undefined}>
         {project ? (

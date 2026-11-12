@@ -1,15 +1,15 @@
 /**
  * IDEA-style project identity: a colour slot (1–9, like RecentProject.ColorN)
- * derived from the project name, and the initials shown in the
+ * derived from the project path, and the initials shown in the
  * title bar's project widget.
  */
 
 export const PROJECT_COLOR_COUNT = 9;
 
-/** Stable 1-based colour slot for a project name. */
-export function projectColorIndex(name: string): number {
+/** Stable 1-based colour slot for a project path. */
+export function projectColorIndex(path: string): number {
   let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
+  for (let i = 0; i < path.length; i++) h = (h * 31 + path.charCodeAt(i)) | 0;
   return (Math.abs(h) % PROJECT_COLOR_COUNT) + 1;
 }
 
@@ -55,8 +55,8 @@ const FALLBACK: Record<number, [string, string]> = {
   9: ["var(--vcs-added)", "var(--success)"],
 };
 
-export function projectColorVars(name: string): Record<string, string> {
-  const n = projectColorIndex(name);
+export function projectColorVars(path: string): Record<string, string> {
+  const n = projectColorIndex(path);
   const [start, end] = FALLBACK[n]!;
   return {
     "--project-color": `var(--project-color-${n}, ${start})`,

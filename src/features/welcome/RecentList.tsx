@@ -43,9 +43,9 @@ export async function askRemoveRecent(project: RecentProject) {
 }
 
 /** Rounded-square project avatar; same colour slot and initials as the title bar's project widget. */
-export function ProjectBadge({ name, className }: { name: string; className?: string }) {
+export function ProjectBadge({ name, path, className }: { name: string; path: string; className?: string }) {
   return (
-    <span className={clsx(styles.tile, className)} style={projectColorVars(name)} aria-hidden>
+    <span className={clsx(styles.tile, className)} style={projectColorVars(path)} aria-hidden>
       {projectInitials(name)}
     </span>
   );
@@ -183,7 +183,7 @@ function RecentRow({
   const when = relativeTime(m.project.openedAtMs);
   return (
     <div className={clsx(styles.recent, compact && styles.recentCompact)}>
-      <ProjectBadge name={m.project.name} />
+      <ProjectBadge name={m.project.name} path={m.project.path} />
       <span className={styles.recentText}>
         <span className={styles.recentTop}>
           <HighlightedText

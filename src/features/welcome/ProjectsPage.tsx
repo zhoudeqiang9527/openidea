@@ -218,7 +218,7 @@ function ProjectRow({
         showContextMenu(e, recentMenu(m.project));
       }}
     >
-      <ProjectBadge name={m.project.name} className={styles.projectBadge} />
+      <ProjectBadge name={m.project.name} path={m.project.path} className={styles.projectBadge} />
       <span className={styles.projectText}>
         <HighlightedText className={styles.projectName} text={m.project.name} indices={m.nameMatch} tone="strong" />
         {stage ? (

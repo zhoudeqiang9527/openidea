@@ -189,7 +189,7 @@ function Header({ first, children }: { first: boolean; children: ReactNode }) {
 function ProjectRow({ m, active }: { m: RecentMatch; active: boolean }) {
   return (
     <>
-      <ProjectBadge name={m.project.name} className={styles.badge} />
+      <ProjectBadge name={m.project.name} path={m.project.path} className={styles.badge} />
       <span className={styles.text}>
         <span className={styles.top}>
           <HighlightedText
