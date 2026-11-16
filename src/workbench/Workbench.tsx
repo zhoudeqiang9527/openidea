@@ -27,10 +27,15 @@ import styles from "./Workbench.module.css";
 /** LightEdit: editor tabs only; no tool windows, toolbar widgets or project status items. */
 function LightEditFrame({ title }: { title?: string }) {
   const path = useEditorRegistry((s) => s.active?.ctx.path);
+  const fullPath = useProject((s) => s.settings?.appearance?.fullPathInTitle === true);
   const distractionFree = useDistractionFree((s) => s.active);
   return (
     <>
-      <TitleBar lightEdit bare={distractionFree} title={title ?? (path ? basename(path) : "LightEdit")} />
+      <TitleBar
+        lightEdit
+        bare={distractionFree}
+        title={title ?? (path ? (fullPath ? path : basename(path)) : "LightEdit")}
+      />
       <main className={styles.lightEdit} data-light-edit>
         <div className={styles.lightEditIsland}>
           <EditorArea />

@@ -3,6 +3,7 @@ import clsx from "clsx";
 import { useActions } from "@/platform/actions";
 import { shortcutLabel, useKeymap } from "@/platform/keymap";
 import { useProject } from "@/platform/project";
+import { useEditorRegistry } from "@/editor/api";
 import { BarButton, Icon, IconButton, Menu, type MenuItem, showContextMenu, T } from "@/ui";
 import { useContributions, useWorkbenchSlots, type TitleItemContribution } from "./contributions";
 import { ErrorBoundary, Slot } from "./ErrorBoundary";
@@ -291,6 +292,8 @@ export function TitleBar({
 }) {
   const overlay = usePlatform((s) => s.overlayTitleBar);
   const frameless = usePlatform((s) => s.framelessTitleBar);
+  const fullPath = useProject((s) => s.settings?.appearance?.fullPathInTitle === true);
+  const activePath = useEditorRegistry((s) => s.active?.ctx.path);
   const { map, shown, menu } = useToolbar();
   const [menuExpanded, setMenuExpanded] = useState(false);
   const [bar, setBar] = useState<HTMLElement | null>(null);
@@ -330,6 +333,11 @@ export function TitleBar({
         </span>
       )}
       {toolbar && !menuExpanded && shown.left.map(entry)}
+      {toolbar && !menuExpanded && fullPath && activePath && (
+        <span className={styles.windowTitle} title={activePath} {...windowDragRegion}>
+          {activePath}
+        </span>
+      )}
       <div className={styles.drag} {...windowDragRegion} />
       {!minimal && (
         <>

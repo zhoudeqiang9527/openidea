@@ -5,6 +5,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { registerActions } from "@/platform/actions";
 import { commands, type Settings } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
+import { useEditorRegistry } from "@/editor/api";
 import { usePlatform } from "@/platform/platformInfo";
 import { useThemeOverride } from "./theme";
 import { customizeToolbarItems, gearMenuItems, TitleBar } from "./TitleBar";
@@ -14,6 +15,27 @@ afterEach(() => {
   disposers.forEach((d) => d());
   disposers = [];
   useThemeOverride.setState({ theme: null });
+});
+
+it("shows the active file path in the header when enabled and updates on file changes", () => {
+  const project = useProject.getState();
+  const active = useEditorRegistry.getState().active;
+  const path = "C:/project/src/main.ts";
+  try {
+    useProject.setState({ settings: { appearance: { fullPathInTitle: false } } as Settings });
+    useEditorRegistry.setState({ active: { ctx: { path } } as never });
+    render(<TitleBar />);
+    expect(screen.queryByText(path)).toBeNull();
+    act(() => useProject.setState({ settings: { appearance: { fullPathInTitle: true } } as Settings }));
+    expect(screen.getByText(path)).toBeInTheDocument();
+    act(() => useEditorRegistry.setState({ active: { ctx: { path: "C:/project/other.ts" } } as never }));
+    expect(screen.getByText("C:/project/other.ts")).toBeInTheDocument();
+    act(() => useProject.setState({ settings: { appearance: { fullPathInTitle: false } } as Settings }));
+    expect(screen.queryByText("C:/project/other.ts")).toBeNull();
+  } finally {
+    useProject.setState(project);
+    useEditorRegistry.setState({ active });
+  }
 });
 
 describe("title bar gear menu", () => {
