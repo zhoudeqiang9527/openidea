@@ -6,39 +6,41 @@ use ide_core::remote_settings::{RunTarget, RunTargetKind};
 use ide_core::{IdeError, IdeResult};
 use ide_docker::DockerEndpoint;
 use ide_remote::docker::{
-    ContainerRun, compose_container_root, container_config, container_name, default_container_root,
+    ContainerDebug, ContainerRun, DEBUG_BOOTSTRAP, DEBUG_BOOTSTRAP_NAME, compose_container_root, container_config,
+    container_name, default_container_root,
 };
 use ide_run::RunConfig;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Set by the Debug action on a configuration that runs on a container target: the
+/// program starts under debugpy and waits for the debugger.
+const DEBUG_PARAM: &str = "containerDebug";
 
 /// `config` rewritten to run in a new container of `target`'s image or service.
 pub(super) async fn prepare(host: &Host, root: &Path, target: RunTarget, config: RunConfig) -> IdeResult<RunConfig> {
     if config.kind == "dotnet" || config.kind == "dotnet-test" {
         return Err(IdeError::invalid(".NET Project requires the local machine"));
     }
+    let debug = config.extras.params.get(DEBUG_PARAM).is_some_and(|v| v == "true");
+    if debug && config.debug_adapter.as_deref() != Some("debugpy") {
+        return Err(IdeError::invalid(format!(
+            "'{}' can't be debugged in a container: only Python run configurations can",
+            config.name
+        )));
+    }
     let endpoint = endpoint(&host.data_dir, &target)?;
     let root = root.to_path_buf();
+    let data_dir = host.data_dir.clone();
     host.blocking(move || {
-        if !ide_docker::endpoint_is_local(&endpoint)? {
-            return Err(IdeError::invalid(format!(
-                "Run target '{}' uses a Docker daemon on another machine: the project can only be mounted from a local one",
-                target.name
-            )));
-        }
+        require_local(&endpoint, &target)?;
         let docker = ide_docker::docker_executable().ok_or_else(|| {
             IdeError::unavailable("docker executable not found; install Docker and make sure it is on PATH")
         })?;
-        let container_root = match target.container_root.trim() {
-            "" if target.kind == RunTargetKind::Compose => {
-                let json = ide_docker::compose_config(&endpoint, &root, &target.compose_files)?;
-                compose_container_root(&json, target.service.trim(), &root)?
-            }
-            "" => default_container_root(&root),
-            folder => folder.to_owned(),
-        };
+        let container_root = container_root(&endpoint, &root, &target)?;
         let file_env = env_files(&root, &config)?;
         let name = container_name(&config.id, &unique());
+        let debugging = if debug { Some(Debugging::prepare(&data_dir)?) } else { None };
         container_config(
             &config,
             &ContainerRun {
@@ -50,14 +52,70 @@ pub(super) async fn prepare(host: &Host, root: &Path, target: RunTarget, config:
                 file_env: &file_env,
                 name: &name,
                 user: user(&root, &target),
+                debug: debugging.as_ref().map(|d| ContainerDebug {
+                    port: d.port,
+                    bootstrap_dir: &d.bootstrap_dir,
+                    debugpy: d.debugpy.as_deref(),
+                }),
             },
         )
     })
     .await
 }
 
+/// The project can only be bind-mounted from a daemon on this machine.
+pub(crate) fn require_local(endpoint: &DockerEndpoint, target: &RunTarget) -> IdeResult<()> {
+    if !ide_docker::endpoint_is_local(endpoint)? {
+        return Err(IdeError::invalid(format!(
+            "Run target '{}' uses a Docker daemon on another machine: the project can only be mounted from a local one",
+            target.name
+        )));
+    }
+    Ok(())
+}
+
+/// Where the project is in the target's containers.
+pub(crate) fn container_root(endpoint: &DockerEndpoint, root: &Path, target: &RunTarget) -> IdeResult<String> {
+    Ok(match target.container_root.trim() {
+        "" if target.kind == RunTargetKind::Compose => {
+            let json = ide_docker::compose_config(endpoint, root, &target.compose_files)?;
+            compose_container_root(&json, target.service.trim(), root)?
+        }
+        "" => default_container_root(root),
+        folder => folder.to_owned(),
+    })
+}
+
+/// What a debug run mounts and publishes.
+struct Debugging {
+    port: u16,
+    bootstrap_dir: PathBuf,
+    debugpy: Option<PathBuf>,
+}
+
+impl Debugging {
+    fn prepare(data_dir: &Path) -> IdeResult<Self> {
+        // The bootstrap is (re)written on each run, so it matches this version of the IDE.
+        let bootstrap_dir = data_dir.join("container-debug");
+        std::fs::create_dir_all(&bootstrap_dir)?;
+        std::fs::write(bootstrap_dir.join(DEBUG_BOOTSTRAP_NAME), DEBUG_BOOTSTRAP)?;
+        // The managed install the local debugger falls back to (`ide_dap::adapter::prepare_debugpy`).
+        let tools = ide_dap::adapter::tools_root().unwrap_or_else(|| ide_tools::tools_dir(data_dir));
+        let lib = ide_tools::python_lib_dir(&tools, ide_dap::adapter::DEBUGPY_TOOL);
+        let debugpy = lib.join("debugpy").join("__init__.py").is_file().then_some(lib);
+        Ok(Self { port: free_port()?, bootstrap_dir, debugpy })
+    }
+}
+
+/// A port nobody listens on here: debugpy listens on the same port in the container,
+/// published on the loopback interface.
+fn free_port() -> IdeResult<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
 /// The target's Docker connection (Services tool window), by id; none = the CLI's daemon.
-fn endpoint(data_dir: &Path, target: &RunTarget) -> IdeResult<DockerEndpoint> {
+pub(crate) fn endpoint(data_dir: &Path, target: &RunTarget) -> IdeResult<DockerEndpoint> {
     let id = target.docker_connection.trim();
     if id.is_empty() {
         return Ok(DockerEndpoint::Default);

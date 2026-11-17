@@ -1,5 +1,66 @@
 import { expect, test } from "./fixtures";
 
+test("Add Python Interpreter keeps environment labels and fields inside their rows", async ({ workbench: page }) => {
+  await page.keyboard.press("Meta+,");
+  const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+  await settings.getByRole("textbox", { name: "Search settings" }).fill("Python Interpreter");
+  await settings
+    .getByRole("tree", { name: "Settings pages" })
+    .getByRole("treeitem", { name: "Dependencies", exact: true })
+    .click();
+  await settings.getByRole("button", { name: "Add Interpreter…", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Add Python Interpreter", exact: true });
+  await expect(dialog).toBeVisible();
+
+  for (const width of [1000, 800, 520]) {
+    await page.setViewportSize({ width, height: 760 });
+    await expect(async () => {
+      const labelsFit = await dialog.getByRole("list", { name: "Interpreter type" }).evaluate((list) =>
+        [...list.querySelectorAll("button")].every((button) => {
+          const box = button.getBoundingClientRect();
+          const range = document.createRange();
+          range.selectNodeContents(button);
+          return [...range.getClientRects()].every(
+            (r) => r.top >= box.top - 1 && r.bottom <= box.bottom + 1 && r.right <= box.right + 1,
+          );
+        }),
+      );
+      expect(labelsFit).toBe(true);
+    }).toPass({ timeout: 3000 });
+
+    const location = dialog.getByRole("textbox", { name: "Location:", exact: true });
+    const fieldSpacing = await location.evaluate((input) => ({
+      rowHeight: input.parentElement!.getBoundingClientRect().height,
+      fieldHeight: input.getBoundingClientRect().height,
+    }));
+    expect(fieldSpacing.rowHeight).toBeLessThanOrEqual(fieldSpacing.fieldHeight + 1);
+    const base = await dialog.getByRole("button", { name: "Base interpreter", exact: true }).boundingBox();
+    const loc = await location.boundingBox();
+    expect(base!.y - loc!.y - loc!.height).toBeLessThan(50);
+  }
+});
+
+test("Project Structure keeps edits across repeated shortcuts and applies them", async ({ workbench: page }) => {
+  await page.keyboard.press("Meta+;");
+  const dialog = page.getByRole("dialog", { name: "Project Structure", exact: true });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Compiler output", { exact: true }).fill("out/classes");
+  await page.keyboard.press("Meta+;");
+  await expect(dialog.getByLabel("Compiler output", { exact: true })).toHaveValue("out/classes");
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.keyboard.press("Meta+;");
+  await expect(dialog.getByLabel("Compiler output", { exact: true })).toHaveValue("out/classes");
+  await dialog.getByRole("button", { name: "Modules", exact: true }).click();
+  await dialog.getByRole("button", { name: "Dependencies", exact: true }).click();
+  await expect(dialog.getByRole("group", { name: "The project depends on these projects" })).toBeVisible();
+  await dialog.getByRole("button", { name: "Artifacts", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "JAR", exact: true })).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
 test("⌘, opens Settings with the page tree; Escape closes", async ({ workbench: page }) => {
   await page.keyboard.press("Meta+,");
   const dialog = page.getByRole("dialog", { name: "Settings" });
@@ -25,20 +86,20 @@ test("Language Servers page installs a tool with progress (in-memory installer)"
   // The page tree is virtualized; search brings the page into view.
   await dialog.getByRole("textbox", { name: "Search settings" }).fill("Language Servers");
   await dialog.getByRole("treeitem", { name: "Language Servers", exact: true }).click();
-  const list = dialog.getByRole("list", { name: /language servers/i });
-  await expect(list).toBeVisible();
-
-  await list.locator('[data-tool="gopls"]').click();
+  const languages = dialog.getByRole("list", { name: "Languages", exact: true });
+  await languages.getByRole("button", { name: /^Go\b/ }).click();
+  const gopls = dialog.getByLabel("Go tools").locator('[data-tool="gopls"]');
+  await gopls.click();
+  await expect(gopls).toContainText("Missing");
   const details = dialog.getByLabel("gopls details");
-  await expect(details).toContainText("Missing");
   await details.getByRole("button", { name: "Install gopls" }).click();
   await expect(details.getByRole("progressbar", { name: "Installing gopls" })).toBeVisible();
-  await expect(details).toContainText("Installed");
-  await expect(details).toContainText("1.0.0");
+  await expect(gopls).toContainText("Installed");
+  await expect(gopls).toContainText("1.0.0");
   await expect(details.getByRole("button", { name: "Uninstall" })).toBeVisible();
 
   // Tools without an installer explain how to get them.
-  await list.locator('[data-tool="solargraph"]').click();
+  await languages.getByRole("button", { name: /^Ruby\b/ }).click();
   await expect(dialog.getByLabel("solargraph details")).toContainText("gem install solargraph");
 });
 
@@ -61,7 +122,8 @@ test("font picker supports manual families and CJK fallback in browser developme
   expect(interLoaded).toBe(true);
   await family.fill("Inter");
   await family.press("Enter");
-  await expect(dialog.getByLabel("Font preview")).toHaveCSS("font-family", /^"Inter Variable",/);
+  // Computed styles drop redundant quotes around single-token families ("Inter" -> Inter).
+  await expect(dialog.getByLabel("Font preview")).toHaveCSS("font-family", /^Inter, "Inter Variable",/);
   const fallback = dialog.getByRole("combobox", { name: "Fallback font", exact: true });
   await family.fill("Maple Mono NF");
   await family.press("Enter");

@@ -31,7 +31,7 @@ import { djangoLabel, djangoTestsOf, hasDjangoTests } from "./djangoTypes";
 import { firstTopLevelType, scanJvmTargets, simpleClassName } from "./jvmTargets";
 import { isWindows } from "./jvmTypes";
 import { inheritedRunTargets } from "./inheritedMain";
-import { detectRunTargets, targetConfig, targetLanguage, type RunTarget } from "./targets";
+import { detectRunTargets, goFuzzConfig, targetConfig, targetLanguage, zigTargets, type RunTarget } from "./targets";
 import { tx } from "@/platform/i18n";
 
 export interface LocatedTool {
@@ -50,9 +50,11 @@ export interface ToolEnv {
   python?: string | null;
   /** The PHP interpreter chosen in settings (else the `php` on `PATH`). */
   php?: string | null;
-  /** The project root has `deno.json(c)` / `bun.lock(b)`. */
+  /** Run JavaScript / TypeScript with Deno / Bun: the project has `deno.json(c)` / `bun.lock(b)`, or `preferred`. */
   deno?: boolean;
   bun?: boolean;
+  /** Deno / Bun was chosen as the preferred runtime, so it also runs files outside the project. */
+  preferred?: boolean;
 }
 
 /** Names only: every tool unknown. */
@@ -126,6 +128,9 @@ function scopedInput<T extends Pick<ContextInput, "root" | "configs">>(input: T)
       ...c,
       cwd: c.cwd == null ? c.cwd : relative(c.cwd),
       ...(c.module == null ? {} : { module: relative(c.module) }),
+      ...(c.kind.startsWith("dotnet") && c.params?.project
+        ? { params: { ...c.params, project: relative(c.params.project) } }
+        : {}),
       ...(c.kind === "go" && c.params?.module != null
         ? { params: { ...c.params, module: relative(c.params.module) } }
         : {}),
@@ -217,7 +222,9 @@ export type ScriptLanguage =
   | "cpp"
   | "dart"
   | "elixir"
+  | "escript"
   | "scala"
+  | "zig"
   | "shebang";
 
 /** `#!/usr/bin/env -S deno run` → `["deno", "run"]`; `#!/bin/zsh -f` → `["/bin/zsh", "-f"]`. */
@@ -256,7 +263,9 @@ export function scriptLanguage(path: string, content?: string): ScriptLanguage |
   if (/\.(cpp|cc|cxx|c\+\+)$/.test(name)) return "cpp";
   if (/\.dart$/.test(name)) return "dart";
   if (/\.exs$/.test(name)) return "elixir";
+  if (/\.escript$/.test(name)) return "escript";
   if (/\.(scala|sc)$/.test(name)) return "scala";
+  if (/\.zig$/.test(name)) return "zig";
   if (!name.includes(".") && shebang(content)) return "shebang";
   return null;
 }
@@ -310,8 +319,12 @@ export function toolsFor(lang: ScriptLanguage, content?: string): string[] {
       return ["dart"];
     case "elixir":
       return ["elixir"];
+    case "escript":
+      return ["escript"];
     case "scala":
       return ["scala-cli"];
+    case "zig":
+      return ["zig"];
   }
 }
 
@@ -335,7 +348,9 @@ const INSTALL: Record<string, string> = {
   cpp: "Install a C++ compiler: `xcode-select --install` (clang++) or `brew install gcc`.",
   dart: "Install the Dart SDK (`brew install dart-sdk`).",
   elixir: "Install Elixir (`brew install elixir`).",
+  escript: "Install Erlang/OTP (`brew install erlang`).",
   scala: "Install Scala CLI (`brew install Virtuslab/scala-cli/scala-cli`).",
+  zig: "Install Zig from https://ziglang.org/download (or `brew install zig`).",
   shell: "Install the shell named in the script's #! line.",
   shebang: "Install the interpreter named in the script's #! line.",
 };
@@ -353,6 +368,7 @@ const LANGUAGE_NAMES: Partial<Record<ScriptLanguage, string>> = {
   c: "A C compiler",
   cpp: "A C++ compiler",
   scala: "Scala CLI",
+  zig: "Zig",
 };
 
 function missing(lang: ScriptLanguage, file: string, tools: string[]): Missing {
@@ -421,6 +437,7 @@ function site(input: ContextInput): FileSite {
     python: ["python", "pytest", "django-test"],
     ruby: ["ruby", "rake", "rspec"],
     php: ["php", "phpunit", "composer"],
+    zig: ["zig", "zig-application"],
   };
   const owner =
     inside && language
@@ -508,16 +525,27 @@ function pythonCommand(input: ContextInput, env: ToolEnv, s: FileSite): { comman
   return t ? { command: t.command, prefix: [] } : null;
 }
 
+/** The preferred runtime is not installed: say so rather than run the file with another one. */
+function preferredMissing(file: string, runtime: string, command: string, site: string): Missing {
+  return {
+    title: tx`Cannot run '${file}'`,
+    body: tx`${runtime} was not found (looked for \`${command}\`). Install it from ${site}, or choose another preferred runtime in Settings › Languages & Frameworks › JavaScript Runtime.`,
+  };
+}
+
 function jsRuntime(lang: "js" | "ts", env: ToolEnv, s: FileSite): Produced {
   const name = s.file;
   const ok = (config: RunConfig): Produced => ({ name, scope: "file", config });
-  if (s.inProject && env.deno) {
+  if ((s.inProject || env.preferred) && env.deno) {
     const deno = pick(env, ["deno"]);
     if (deno) return ok(fileConfig(s, "deno", deno.command, ["run", s.arg], "js-debug"));
+    if (env.preferred)
+      return { name, scope: "file", missing: preferredMissing(name, "Deno", "deno", "https://deno.com") };
   }
-  if (s.inProject && env.bun) {
+  if ((s.inProject || env.preferred) && env.bun) {
     const bun = pick(env, ["bun"]);
-    if (bun) return ok(fileConfig(s, "bun", bun.command, ["run", s.arg]));
+    if (bun) return ok(fileConfig(s, "bun", bun.command, ["run", s.arg], "bun-dap"));
+    if (env.preferred) return { name, scope: "file", missing: preferredMissing(name, "Bun", "bun", "https://bun.sh") };
   }
   const node = env.tool("node");
   const nodeCmd = node === undefined ? "node" : (node?.path ?? null);
@@ -598,6 +626,59 @@ function compiled(
   const binary: RunConfig = { ...config, kind: "native", command: out, args: runArgs, isTest: false };
   return { name, scope, config, debug: { build: buildConfig, config: binary } };
 }
+
+/**
+ * A Zig file: `zig run` its `main`, `zig test` its tests (one of them with `--test-filter`). Debugging
+ * builds the same file into a binary (`build-exe`, or `test --test-no-exec`) and launches that.
+ */
+function zigFile(input: ContextInput, env: ToolEnv, s: FileSite, test?: { name: string; filter?: string }): Produced {
+  const win = !!env.windows;
+  const name = test?.name ?? s.file;
+  const scope = test?.filter !== undefined ? "element" : "file";
+  const zig = pick(env, toolsFor("zig"));
+  if (!zig) return { name, scope, missing: missing("zig", s.file, toolsFor("zig")) };
+  const filter = test?.filter !== undefined ? ["--test-filter", test.filter] : [];
+  const idPath = test?.filter !== undefined ? `${s.idPath}#${test.filter}` : s.idPath;
+  const dir = env.compileDir.replace(/\\/g, "/").replace(/(.)\/+$/, "$1");
+  const out = nativePath(
+    `${dir}/${stemOf(s.file)}-${hash(input.path + (test?.filter ?? ""))}${test ? "-test" : ""}${win ? ".exe" : ""}`,
+    win,
+  );
+  const config: RunConfig = {
+    ...fileConfig(s, "zig", zig.command, test ? ["test", s.arg, ...filter] : ["run", s.arg], "codelldb"),
+    id: `context:file:${idPath}`,
+    name,
+    isTest: !!test,
+  };
+  const compile = test ? ["test", s.arg, ...filter, "--test-no-exec"] : ["build-exe", s.arg];
+  const buildConfig: RunConfig = {
+    ...config,
+    id: `context:build:${idPath}`,
+    name: `Build ${s.file}`,
+    command: `${mkdirLine(dir, win)} && ${shellLine([zig.command, ...compile, `-femit-bin=${out}`], win)}`,
+    args: [],
+    isTest: false,
+    debugAdapter: null,
+  };
+  const binary: RunConfig = {
+    ...config,
+    kind: "native",
+    command: out,
+    args: [],
+    isTest: false,
+    // Marks the debugged program as Zig: CodeLLDB's source mode stays off (see nativeLaunch).
+    params: { language: "zig" },
+  };
+  return { name, scope, config, debug: { build: buildConfig, config: binary } };
+}
+
+/** The executable of the file's `build.zig` whose root source file it is. */
+function zigExecutable(rel: string, configs: readonly RunConfig[]): RunConfig | undefined {
+  return buildOwners(rel, configs, ["zig-application"]).find((c) => c.params?.source === relativeToCwd(rel, c));
+}
+
+const hasZigMain = (content?: string) => content === undefined || /^pub\s+fn\s+main\s*\(/m.test(content);
+const hasZigTests = (content?: string) => content !== undefined && /^\s*test\s+("|[A-Za-z_])/m.test(content);
 
 /**
  * A single Java file. The source launcher (`java Hi.java`, JEP 330) runs the file's first
@@ -743,7 +824,7 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     // Project-aware: test files through the project's test runner, Cargo / Go / Gradle / Maven mains.
     const role = fileRole(rel, input.content, undefined, hasDjangoTests(configs));
     if (role === "test") {
-      const found = testConfigFor(rel, configs);
+      const found = testConfigFor(rel, configs, undefined, input.content);
       const test = found && goTestNamed(found, input);
       if (test) return { name: test.name, scope: "file", config: test };
     }
@@ -777,6 +858,11 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
       if (role !== "main") return null;
       const main = contextConfig(rel, configs, input.content);
       return main ? { name: main.name, scope: "file", config: main } : null;
+    }
+    if (lang === "zig" && hasZigMain(input.content)) {
+      // A `build.zig` executable built from this file: its installed binary, built first.
+      const exe = zigExecutable(rel, configs);
+      if (exe) return { name: exe.name, scope: "file", config: exe };
     }
     if (lang === "go" && hasBuildTool(rel, configs, ["go"])) {
       if (!hasGoMain(input.content)) return null;
@@ -887,10 +973,14 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     }
     case "ruby":
       // Sources roots go on the load path (`-Ilib`), as `rake test` does; paths are project-relative.
-      return simple(lang, s, env, lang, () => [
-        ...(s.inProject ? rubyLoadPath(currentRoots(), s.cwd, input.root) : []),
-        s.arg,
-      ]);
+      return simple(
+        lang,
+        s,
+        env,
+        lang,
+        () => [...(s.inProject ? rubyLoadPath(currentRoots(), s.cwd, input.root) : []), s.arg],
+        "rdbg",
+      );
     case "php":
       if (env.php) return { name: s.file, scope: "file", config: fileConfig(s, "php", env.php, [s.arg], "php-debug") };
       return simple(lang, s, env, lang, () => [s.arg], "php-debug");
@@ -898,6 +988,7 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     case "lua":
     case "swift":
     case "elixir":
+    case "escript":
       return simple(lang, s, env, lang, () => [s.arg]);
     case "r":
       return simple(lang, s, env, "r", () => [s.arg]);
@@ -927,6 +1018,10 @@ export function produceFile(input: ContextInput, env: ToolEnv): Produced | null 
     case "c":
     case "cpp":
       return hasCMain(input.content) ? compiled(input, env, s, lang) : null;
+    case "zig":
+      if (hasZigMain(input.content)) return zigFile(input, env, s);
+      // A file with tests only: run them all.
+      return hasZigTests(input.content) ? zigFile(input, env, s, { name: s.file }) : null;
   }
   return null;
 }
@@ -1009,6 +1104,7 @@ export function fileTargets(
   const s = { inProject: isProjectPath(input), rel: relTo(input.path, input.root) };
   const rust = /\.rs$/.test(input.path);
   if (/\.(c|cpp|cc|cxx)$/.test(input.path)) return standaloneTargets(content, input.path);
+  if (/\.zig$/.test(input.path)) return zigTargets(content);
   const cargo =
     s.inProject && (cargoOwner(s.rel, input.configs).length > 0 || /(^|\/)(src|tests|examples|benches)\//.test(s.rel));
   if (rust && !cargo) return standaloneTargets(content, input.path);
@@ -1042,6 +1138,10 @@ function elementProduction(input: ContextInput, env: ToolEnv, target: RunTarget)
     const file = produceFile(input, env);
     return file ? { ...file, scope: "element" } : null;
   }
+  if (/\.zig$/.test(input.path)) {
+    // `--test-filter` matches a substring of the test's full name.
+    return zigFile(input, env, s, { name: target.name, filter: target.name });
+  }
   const rust = /\.rs$/.test(input.path);
   if (rust && !(s.inProject && cargoOwner(rel, input.configs).length)) {
     const path = target.path.join("::");
@@ -1072,6 +1172,17 @@ export function produceContext(input: ContextInput, env: ToolEnv): Produced | nu
   return produceFile(input, env);
 }
 
+/** GoLand's "Run '<name>' with Fuzzing": the `Fuzz` function at the caret, run with `go test -fuzz`. */
+export function produceFuzz(input: ContextInput, env: ToolEnv): Produced | null {
+  input = scopedInput(input);
+  if (input.content === undefined || input.line === undefined || !/_test\.go$/.test(input.path)) return null;
+  const targets = fileTargets(input, input.content.slice(0, 400_000));
+  const inner = innermostTarget(input.content, targets, input.line);
+  const produced = inner && elementProduction(input, env, inner);
+  const config = inner && produced?.config && goFuzzConfig(produced.config, inner);
+  return produced && config ? { ...produced, config } : null;
+}
+
 /**
  * Every configuration that can run the context, when several test
  * configurations match it equally well (`npm run test` and `npm run test:unit`):
@@ -1098,7 +1209,7 @@ export function produceContextChoices(input: ContextInput, env: ToolEnv): Produc
   for (const base of bases) {
     const found = element
       ? targetConfig(element, rel, [...input.configs], input.content, base)
-      : testConfigFor(rel, [...input.configs], base);
+      : testConfigFor(rel, [...input.configs], base, input.content);
     const config = found && goTestNamed(found, input, element?.name);
     if (!config || out.some((o) => o.config?.id === config.id)) continue;
     out.push({ name: config.name, scope: produced.scope, config, detail: base.name });

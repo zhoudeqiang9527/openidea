@@ -1,6 +1,8 @@
+import { writeClipboardText } from "@/platform/clipboard";
 import { useMemo, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import clsx from "clsx";
 import { call, commands, type RecentProject, type RecentProjectGroup } from "@/platform/ipc";
+import { revealInFileManager, showInFileManagerLabel } from "@/platform/fileManager";
 import { parseRemoteLocation } from "@/platform/remote";
 import {
   HighlightedText,
@@ -32,8 +34,13 @@ import {
 import styles from "./Welcome.module.css";
 import { tx } from "@/platform/i18n";
 
-/** IDEA's "Remove Recent Project" confirmation, then removes it from the list. */
-export async function askRemoveRecent(project: RecentProject) {
+/**
+ * IDEA's "Remove Recent Project" confirmation, then removes it from the list.
+ * `before` runs just before the confirmation opens: hosts above the dialog's
+ * layer (a popup) pass their closer so the confirmation is not covered (#1883).
+ */
+export async function askRemoveRecent(project: RecentProject, before?: () => void) {
+  before?.();
   const ok = await confirm({
     title: "Remove Recent Project",
     message: tx`Remove '${project.name}' from the list of recent projects?`,
@@ -43,12 +50,31 @@ export async function askRemoveRecent(project: RecentProject) {
 }
 
 /** Rounded-square project avatar; same colour slot and initials as the title bar's project widget. */
-export function ProjectBadge({ name, path, className }: { name: string; path: string; className?: string }) {
+export function ProjectBadge({
+  name,
+  path,
+  className,
+  missing,
+}: {
+  name: string;
+  path: string;
+  className?: string;
+  missing?: boolean;
+}) {
   return (
-    <span className={clsx(styles.tile, className)} style={projectColorVars(path)} aria-hidden>
+    <span
+      className={clsx(styles.tile, missing && styles.tileMissing, className)}
+      style={projectColorVars(path)}
+      aria-hidden
+    >
       {projectInitials(name)}
     </span>
   );
+}
+
+/** The tooltip of a recent project whose folder is gone. */
+export function unavailableTitle(project: Pick<RecentProject, "path" | "missing">): string | undefined {
+  return project.missing ? tx`${project.path} (unavailable)` : undefined;
 }
 
 /** New Project Group…: asks for a name; with `path`, that project moves into the new group. */
@@ -108,7 +134,7 @@ export function groupMenu(group: RecentProjectGroup): MenuItem[] {
   ];
 }
 
-export function recentMenu(project: RecentProject, onOpened?: () => void): MenuItem[] {
+export function recentMenu(project: RecentProject, onOpened?: () => void, onRemove?: () => void): MenuItem[] {
   // A remote project has no local folder.
   const remote = parseRemoteLocation(project.path);
   const items: MenuItem[] = [
@@ -131,16 +157,15 @@ export function recentMenu(project: RecentProject, onOpened?: () => void): MenuI
       : { kind: "action", action: "file.openInNewWindow", arg: project.path, label: "Open in New Window" },
     {
       id: "reveal",
-      label: "Show in Finder",
+      label: showInFileManagerLabel(),
       icon: "external-link",
-      run: () =>
-        void import("@tauri-apps/plugin-opener").then((m) => m.revealItemInDir(project.path)).catch(() => undefined),
+      run: () => void revealInFileManager(project.path, null).catch(() => undefined),
     },
     {
       id: "copy",
       label: "Copy Path",
       icon: "copy",
-      run: () => void navigator.clipboard?.writeText(project.path).catch(() => undefined),
+      run: () => void writeClipboardText(project.path).catch(() => undefined),
     },
     { kind: "separator" },
     // Groups hold local projects (remote ones live in this window's own list).
@@ -150,7 +175,7 @@ export function recentMenu(project: RecentProject, onOpened?: () => void): MenuI
       label: "Remove from Recent Projects…",
       icon: "close",
       danger: true,
-      run: () => void askRemoveRecent(project),
+      run: () => void askRemoveRecent(project, onRemove),
     },
   ];
   return remote ? items.filter((i) => !("id" in i && i.id === "reveal")) : items;
@@ -182,12 +207,12 @@ function RecentRow({
   const opening = useRecent((s) => s.opening === m.project.path);
   const when = relativeTime(m.project.openedAtMs);
   return (
-    <div className={clsx(styles.recent, compact && styles.recentCompact)}>
-      <ProjectBadge name={m.project.name} path={m.project.path} />
+    <div className={styles.recent} title={unavailableTitle(m.project)}>
+      <ProjectBadge name={m.project.name} path={m.project.path} missing={!!m.project.missing} />
       <span className={styles.recentText}>
         <span className={styles.recentTop}>
           <HighlightedText
-            className={styles.recentName}
+            className={clsx(styles.recentName, m.project.missing && styles.unavailable)}
             text={m.project.name}
             indices={m.nameMatch}
             tone={active ? "accent" : "strong"}

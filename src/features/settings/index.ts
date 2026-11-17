@@ -5,7 +5,8 @@
  * runtime application of keymap / UI font size / high-contrast settings.
  *
  * On the desktop Settings open in a native child window (`activateSettingsWindow`
- * runs there); in the browser build they open as an in-page dialog.
+ * runs there) unless Appearance › "Open Settings in a separate window" is off;
+ * then, and in the browser build, they open as an in-page dialog.
  *
  * `executeAction("file.settings", "keymap")` opens a specific page;
  * `file.newProjectsSettings` (IDEA's Settings for New Projects) edits the
@@ -14,15 +15,21 @@
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { registerActions, type Action } from "@/platform/actions";
 import { call, commands, isTauri } from "@/platform/ipc";
-import { isPopupOpen, lazyComponent } from "@/ui";
+import { isPopupOpen, lazyComponent, lazyWhen } from "@/ui";
 import { loadSettings, useProject } from "@/platform/project";
 import { logError } from "@/platform/errorLog";
 import { restoreRemote } from "@/platform/remote";
 import { provideSettingsSearchIndex, registerOverlay } from "@/workbench/contributions";
 import { windowBackgroundHex } from "@/workbench/theme";
-import { LazySettingsDialog, loadBuiltinPages, unloadBuiltinPages } from "./dialog/LazySettingsDialog";
+import {
+  LazyProjectStructureDialog,
+  LazySettingsDialog,
+  loadBuiltinPages,
+  unloadBuiltinPages,
+} from "./dialog/LazySettingsDialog";
 import {
   closeSettings,
+  openProjectStructure,
   openSettings,
   rebaseSettings,
   selectPage,
@@ -31,11 +38,11 @@ import {
   settingsTitle,
   useSettingsDialog,
 } from "./model/staging";
-import { zoomActions } from "./appearanceRuntime";
+import { appearanceToggleActions, navigationBarActions, zoomActions } from "./appearanceRuntime";
 import { activateFileTypes } from "./fileTypesRuntime";
 import { trackRuntimeSettings } from "./runtime";
 import { installActionProxies, installSettingsHost } from "./window/bridge";
-import { AssignShortcutOverlay, showAssignShortcut } from "./keymap/AssignShortcut";
+import { showAssignShortcut, useAssignShortcut } from "./keymap/assignShortcutStore";
 import { settingsSearchEntries } from "./searchIndex";
 import { activatePythonStatus } from "./languages/PythonStatus";
 import { activatePhpStatus } from "./languages/PhpStatus";
@@ -91,9 +98,11 @@ function settingsActions(open: (page?: string, newProjects?: boolean) => void): 
   ];
 }
 
-/** Native Settings window when the backend can make one, else the dialog. */
+const separateWindow = () => useProject.getState().settings?.appearance?.settingsInSeparateWindow !== false;
+
+/** The native Settings window when it is enabled and the backend can make one, else the dialog. */
 async function showSettings(page?: string, newProjects = false) {
-  if (isTauri()) {
+  if (isTauri() && separateWindow()) {
     try {
       await call(commands.windowOpenSettings(page ?? null, newProjects, windowBackgroundHex()));
       return;
@@ -102,8 +111,12 @@ async function showSettings(page?: string, newProjects = false) {
     }
   }
   await loadBuiltinPages();
-  openSettings(page, { newProjects });
+  // Like a launch into the open window: go to the page, keep the edits not applied yet.
+  if (useSettingsDialog.getState().open) relaunch({ page, newProjects });
+  else openSettings(page, { newProjects });
 }
+
+const useAssignShortcutOpen = () => useAssignShortcut((s) => s.actionId !== null);
 
 export function activate(): () => void {
   const disposers = [
@@ -113,10 +126,28 @@ export function activate(): () => void {
     activatePhpStatus(),
     unloadBuiltinPages,
     registerOverlay({ id: "settings.dialog", component: LazySettingsDialog }),
+    registerOverlay({ id: "settings.projectStructure", component: LazyProjectStructureDialog }),
     registerActions(zoomActions()),
+    registerActions(appearanceToggleActions()),
+    registerActions(navigationBarActions()),
     registerActions(settingsActions((page, newProjects) => void showSettings(page, newProjects))),
+    registerActions([
+      {
+        id: "file.projectStructure",
+        title: "Project Structure…",
+        category: "File",
+        icon: "folder",
+        keywords: ["project structure", "sdk", "jdk", "modules", "libraries", "facets", "artifacts", "sources"],
+        run: ({ arg }) => openProjectStructure(typeof arg === "string" ? arg : undefined),
+      },
+    ]),
     activateFileTypes(),
-    registerOverlay({ id: "settings.assignShortcut", component: AssignShortcutOverlay }),
+    registerOverlay({
+      id: "settings.assignShortcut",
+      component: lazyWhen(useAssignShortcutOpen, () =>
+        import("./keymap/AssignShortcut").then((m) => m.AssignShortcutOverlay),
+      ),
+    }),
     registerActions([
       {
         // Search Everywhere's ⌥↵ on an action (arg: the action id).

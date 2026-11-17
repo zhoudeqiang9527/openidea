@@ -65,8 +65,11 @@ impl Fixture {
         self.git(&["commit", "-q", "-m", msg]);
         self.git(&["rev-parse", "HEAD"])
     }
+    /// The repository of a trusted project.
     fn repo(&self) -> Repo {
-        Repo::discover(&self.dir).unwrap().expect("repository found")
+        let repo = Repo::discover(&self.dir).unwrap().expect("repository found");
+        repo.set_execution_allowed(true);
+        repo
     }
     fn path(&self, rel: &str) -> PathBuf {
         self.dir.join(rel)
@@ -594,6 +597,73 @@ fn commit_files_kinds() {
     assert!(repo.commit_files("HEAD").unwrap().len() == 4);
 }
 
+/// Stages a symbolic link (mode 120000) to `target` without touching the working tree, so
+/// the test needs no symlink support from the file system.
+fn stage_link(fx: &Fixture, path: &str, target: &str) {
+    let blob = fx._tmp.path().join("link-target");
+    std::fs::write(&blob, target).unwrap();
+    let id = fx.git(&["hash-object", "-w", blob.to_str().unwrap()]);
+    fx.git(&["update-index", "--add", "--cacheinfo", &format!("120000,{id},{path}")]);
+}
+
+/// Git records only a link's target path; the changed-file lists resolve it in the commit's tree (#3777).
+#[test]
+fn changed_files_classify_symbolic_links_in_the_revision_tree() {
+    let fx = Fixture::new();
+    for dir in ["dir1", "dir2", "nested/deep"] {
+        fx.write(&format!("{dir}/example.txt"), "example\n");
+    }
+    fx.write("plain.txt", "p\n");
+    let root = fx.commit_all("directories");
+    let cases = [
+        ("link1", "dir1", Some(LinkTarget::Dir)),
+        ("link2", "dir2/", Some(LinkTarget::Dir)),
+        ("link3", "dir3", Some(LinkTarget::Unresolved)),
+        ("file_link", "plain.txt", Some(LinkTarget::File)),
+        ("nested/up", "../dir1/example.txt", Some(LinkTarget::File)),
+        ("nested/here", ".", Some(LinkTarget::Dir)),
+        ("via_link", "link1/example.txt", Some(LinkTarget::File)),
+        ("chain", "link1", Some(LinkTarget::Dir)),
+        ("absolute", "/etc", Some(LinkTarget::Unresolved)),
+        ("escape", "../outside", Some(LinkTarget::Unresolved)),
+        ("loop_a", "loop_b", Some(LinkTarget::Unresolved)),
+        ("loop_b", "loop_a", Some(LinkTarget::Unresolved)),
+        ("through_file", "plain.txt/x", Some(LinkTarget::Unresolved)),
+    ];
+    for (path, target, _) in &cases {
+        stage_link(&fx, path, target);
+    }
+    fx.write("dir1/more.txt", "more\n");
+    fx.git(&["add", "dir1/more.txt"]);
+    fx.git(&["commit", "-q", "-m", "links"]);
+    let links = fx.git(&["rev-parse", "HEAD"]);
+    let repo = fx.repo();
+
+    let check = |files: &[(String, Option<LinkTarget>)], label: &str| {
+        for (path, _, expected) in &cases {
+            let found = files.iter().find(|(p, _)| p == path).unwrap_or_else(|| panic!("{label} {path}: {files:?}"));
+            assert_eq!(found.1, *expected, "{label} {path}");
+        }
+        let plain = files.iter().find(|(p, _)| p == "dir1/more.txt").unwrap();
+        assert_eq!(plain.1, None, "{label}: a regular file is no link");
+    };
+    let pairs = |files: Vec<ChangedFile>| files.into_iter().map(|f| (f.path, f.link)).collect::<Vec<_>>();
+    check(&pairs(repo.commit_files(&links).unwrap()), "commit_files");
+    check(&pairs(repo.diff_revisions(&root, &links).unwrap()), "diff_revisions");
+    let combined = repo.commits_changes(std::slice::from_ref(&links)).unwrap();
+    check(&combined.into_iter().map(|f| (f.path, f.link)).collect::<Vec<_>>(), "commits_changes");
+
+    // A deleted link is described as it was before the deletion; the working tree plays no part.
+    fx.git(&["rm", "-q", "--cached", "link1", "file_link"]);
+    fx.git(&["commit", "-q", "-m", "drop links"]);
+    let dropped = fx.git(&["rev-parse", "HEAD"]);
+    for files in [repo.commit_files(&dropped).unwrap(), repo.diff_revisions(&links, &dropped).unwrap()] {
+        let files = pairs(files);
+        assert!(files.contains(&("link1".into(), Some(LinkTarget::Dir))), "{files:?}");
+        assert!(files.contains(&("file_link".into(), Some(LinkTarget::File))), "{files:?}");
+    }
+}
+
 /// Line counts follow the same first-parent diff as the commit's file list, including renames.
 #[test]
 fn diff_numstat_counts_added_deleted_and_renames() {
@@ -724,6 +794,7 @@ fn file_at_in_a_blobless_clone() {
     let url = format!("file://{}", fx.dir.display());
     git_in(fx.dir.parent().unwrap(), &["clone", "-q", "--filter=blob:none", &url, "clone"]);
     let repo = Repo::discover(&clone).unwrap().unwrap();
+    repo.set_execution_allowed(true);
     // v1's blob was never fetched; reading it fetches it on demand.
     assert_eq!(repo.file_at(&clone.join("f.txt"), Some(&c1), encoding_rs::UTF_8).unwrap().as_deref(), Some("v1\n"));
 }
@@ -765,11 +836,11 @@ fn stash_push_list_apply_pop() {
     let repo = fx.repo();
 
     fx.write("s.txt", "change 1\n");
-    repo.stash_push(Some("first stash"), false, false).unwrap();
+    repo.stash_push(Some("first stash"), false, false, &[]).unwrap();
     assert_eq!(fx.read("s.txt"), "base\n");
     fx.write("s.txt", "change 2\n");
     fx.write("u.txt", "untracked\n");
-    repo.stash_push(None, true, false).unwrap();
+    repo.stash_push(None, true, false, &[]).unwrap();
     assert!(!fx.path("u.txt").exists());
 
     let stashes = repo.stashes().unwrap();
@@ -804,7 +875,7 @@ fn stash_keep_index_reinstate_index_and_branch() {
     fx.write("a.txt", "a staged\n");
     fx.git(&["add", "a.txt"]);
     fx.write("b.txt", "b unstaged\n");
-    repo.stash_push(Some("keep"), false, true).unwrap();
+    repo.stash_push(Some("keep"), false, true, &[]).unwrap();
     // Keep index: the staged change stays, the unstaged one is stashed.
     assert_eq!(fx.read("a.txt"), "a staged\n");
     assert_eq!(fx.read("b.txt"), "b\n");
@@ -980,15 +1051,80 @@ fn checkout_create_detached_delete_rebase() {
     );
 
     repo.checkout("main", false).unwrap();
-    repo.rename_branch("topic", "topic2").unwrap();
+    repo.rename_branch("topic", "topic2", false).unwrap();
     assert!(repo.branches().unwrap().iter().any(|b| b.name == "topic2"));
-    assert!(repo.rename_branch("topic2", "main").is_err(), "existing name must be refused");
-    assert!(repo.rename_branch("topic2", " ").is_err());
-    repo.rename_branch("topic2", "topic").unwrap();
+    assert!(repo.rename_branch("topic2", "main", false).is_err(), "existing name must be refused");
+    assert!(repo.rename_branch("topic2", " ", false).is_err());
+    repo.rename_branch("topic2", "topic", false).unwrap();
     assert!(repo.delete_branch("topic", false).is_err(), "unmerged branch must need force");
     repo.delete_branch("topic", true).unwrap();
     assert!(!repo.branches().unwrap().iter().any(|b| b.name == "topic"));
     assert!(repo.checkout("does-not-exist", false).is_err());
+}
+
+#[test]
+fn renaming_a_branch_keeps_or_drops_its_upstream() {
+    let (fx, _bare) = with_remote();
+    let repo = fx.repo();
+    fx.git(&["branch", "--track", "topic", "origin/main"]);
+
+    let upstream = |name: &str| {
+        repo.branches().unwrap().into_iter().find(|b| b.name == name && !b.remote).and_then(|b| b.upstream)
+    };
+    assert_eq!(upstream("topic").as_deref(), Some("origin/main"));
+
+    // `git branch -m` moves the tracking with the name.
+    repo.rename_branch("topic", "topic2", false).unwrap();
+    assert_eq!(upstream("topic2").as_deref(), Some("origin/main"));
+
+    // Asked to drop it, the new branch tracks nothing.
+    repo.rename_branch("topic2", "topic3", true).unwrap();
+    assert_eq!(upstream("topic3"), None);
+
+    // A branch that tracks nothing has no upstream to drop; that is not an error.
+    fx.git(&["branch", "plain"]);
+    repo.rename_branch("plain", "plain2", true).unwrap();
+    assert!(repo.branches().unwrap().iter().any(|b| b.name == "plain2" && !b.remote));
+}
+
+#[test]
+fn renaming_the_current_branch_keeps_or_drops_its_upstream() {
+    for unset_upstream in [false, true] {
+        let (fx, _bare) = with_remote();
+        let repo = fx.repo();
+        repo.rename_branch("main", "renamed", unset_upstream).unwrap();
+        let branch = repo.branch_info().unwrap();
+        assert_eq!(branch.head.as_deref(), Some("renamed"));
+        assert_eq!(branch.upstream.as_deref(), if unset_upstream { None } else { Some("origin/main") });
+    }
+}
+
+#[test]
+fn failed_branch_rename_does_not_unset_upstream() {
+    let (fx, _bare) = with_remote();
+    let repo = fx.repo();
+    fx.git(&["branch", "occupied"]);
+    assert!(repo.rename_branch("main", "occupied", true).is_err());
+    let branch = repo.branch_info().unwrap();
+    assert_eq!(branch.head.as_deref(), Some("main"));
+    assert_eq!(branch.upstream.as_deref(), Some("origin/main"));
+}
+
+#[test]
+fn branch_rename_reports_when_only_unsetting_upstream_fails() {
+    let (fx, _bare) = with_remote();
+    let repo = fx.repo();
+    // The new branch activates a broken config only after the rename has succeeded.
+    fx.write(".git/broken-config", "[broken\n");
+    fx.git(&["config", "includeIf.onbranch:renamed.path", "broken-config"]);
+    let error = repo.rename_branch("main", "renamed", true).unwrap_err();
+    assert!(error.message.contains("Renamed branch 'main' to 'renamed'"), "{error}");
+    assert!(error.message.contains("could not unset its upstream"), "{error}");
+    assert!(error.message.contains("bad config"), "{error}");
+    std::fs::remove_file(fx.path(".git/broken-config")).unwrap();
+    let branch = repo.branch_info().unwrap();
+    assert_eq!(branch.head.as_deref(), Some("renamed"));
+    assert_eq!(branch.upstream.as_deref(), Some("origin/main"));
 }
 
 #[test]
@@ -1001,7 +1137,7 @@ fn smart_and_force_checkout_with_local_changes_in_the_way() {
     fx.commit_all("other edit");
     fx.git(&["checkout", "-q", "main"]);
     let repo = fx.repo();
-    let opts = |mode| CheckoutOptions { mode, diverged: None };
+    let opts = |mode| CheckoutOptions { mode, ..Default::default() };
 
     // A non-conflicting local edit to a file the switch rewrites.
     fx.write("f.txt", "1\n2\n3\n4\nlocal\n");
@@ -1039,6 +1175,51 @@ fn smart_and_force_checkout_with_local_changes_in_the_way() {
     assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"));
     assert_eq!(fx.read("f.txt"), "1\n2\n3\n4\n5\n");
     assert_eq!(fx.read("untouched.txt"), "new\n", "untracked files survive");
+}
+
+#[test]
+fn checkout_of_a_branch_held_by_another_worktree_reports_it_and_changes_nothing() {
+    let fx = Fixture::new();
+    fx.write("f.txt", "1\n");
+    fx.commit_all("base");
+    let linked = fx._tmp.path().join("linked");
+    fx.git(&["worktree", "add", "-q", "-b", "topic", linked.to_str().unwrap()]);
+    let repo = fx.repo();
+    let none = CheckoutOptions::default();
+    // As git names it: no `\\?\` prefix on Windows.
+    let linked_path = dunce::canonicalize(&linked).unwrap();
+
+    // From the main worktree, the branch the linked worktree has checked out.
+    let outcome = repo.checkout_with("topic", false, &none).unwrap();
+    assert_eq!(outcome, CheckoutOutcome::CheckedOutInWorktree { branch: "topic".into(), path: linked_path.clone() });
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"), "nothing changed");
+
+    // With local changes in the way too: reported before any Smart Checkout stash.
+    fx.write("f.txt", "changed\n");
+    let smart = CheckoutOptions { mode: CheckoutMode::Smart, ..Default::default() };
+    let outcome = repo.checkout_with("topic", false, &smart).unwrap();
+    assert_eq!(outcome, CheckoutOutcome::CheckedOutInWorktree { branch: "topic".into(), path: linked_path.clone() });
+    assert_eq!(fx.read("f.txt"), "changed\n", "local changes untouched");
+    assert!(repo.stashes().unwrap().is_empty());
+    fx.git(&["reset", "-q", "--hard"]);
+
+    // The same refusal from the linked worktree, for the main worktree's branch.
+    let linked_repo = Repo::discover(&linked).unwrap().unwrap();
+    linked_repo.set_execution_allowed(true);
+    let outcome = linked_repo.checkout_with("main", false, &none).unwrap();
+    let main_path = dunce::canonicalize(&fx.dir).unwrap();
+    assert_eq!(outcome, CheckoutOutcome::CheckedOutInWorktree { branch: "main".into(), path: main_path });
+    assert_eq!(linked_repo.branch_info().unwrap().head.as_deref(), Some("topic"));
+
+    // Overwriting such a branch (New Branch with Checkout) names the worktree, not raw stderr.
+    let error = repo.create_branch_with_overwrite("topic", Some("main"), true, true).unwrap_err();
+    assert!(error.message.contains("branch 'topic' is already checked out in worktree"), "{error}");
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"));
+
+    // Checkout Anyway: both worktrees then have the branch.
+    let anyway = CheckoutOptions { ignore_other_worktrees: true, ..Default::default() };
+    assert_eq!(repo.checkout_with("topic", false, &anyway).unwrap(), CheckoutOutcome::Done);
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("topic"));
 }
 
 #[test]
@@ -1204,6 +1385,71 @@ fn partial_commit_of_chosen_hunks_leaves_worktree_and_index_alone() {
 }
 
 #[test]
+fn pending_changes_show_what_the_commit_would_hold_without_touching_the_index() {
+    let fx = Fixture::new();
+    let base = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+    fx.write("f.txt", base);
+    fx.write("staged.txt", "s\n");
+    fx.write("old.txt", "moved\nfile\nwith\nlines\n");
+    fx.write("bin.dat", "\0\x01");
+    fx.commit_all("base");
+    let repo = fx.repo();
+    let utf8 = |_: &Path| -> ide_core::IdeResult<&encoding_rs::Encoding> { Ok(encoding_rs::UTF_8) };
+
+    let edited = "A\nb\nc\nd\ne\nf\ng\nh\ni\nJ\n";
+    fx.write("f.txt", edited);
+    fx.write("staged.txt", "s2\n");
+    fx.git(&["add", "staged.txt"]);
+    fx.git(&["mv", "old.txt", "new.txt"]);
+    fx.write("bin.dat", "\0\x02");
+    fx.write("added.txt", "new\n");
+    let index_before = std::fs::read(fx.dir.join(".git/index")).unwrap();
+
+    // The index as it is: the staged file and the rename.
+    let plain = repo.pending_changes(&CommitOptions::default(), 1 << 20, &utf8).unwrap();
+    let summary: Vec<_> = plain
+        .iter()
+        .map(|c| (c.status, c.path.strip_prefix(&fx.dir).unwrap().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(summary, [("renamed", "new.txt".to_owned()), ("modified", "staged.txt".to_owned())]);
+    assert_eq!(plain[0].old_path.as_deref(), Some(fx.path("old.txt").as_path()));
+    assert!(plain[1].diff.as_deref().unwrap().contains("-s\n+s2\n"), "{:?}", plain[1].diff);
+
+    // A selection: the first hunk of f.txt, the binary and the new file, staged.txt left out.
+    let hunks = diff_hunks(base, edited);
+    let options = CommitOptions {
+        partial: vec![PartialCommitFile { path: fx.path("f.txt").into(), hunks: vec![range(&hunks[0])] }],
+        stage: vec![fx.path("bin.dat").into(), fx.path("added.txt").into()],
+        exclude: vec![fx.path("staged.txt").into()],
+        ..Default::default()
+    };
+    let picked = repo.pending_changes(&options, 1 << 20, &utf8).unwrap();
+    let by_name = |name: &str| picked.iter().find(|c| c.path == fx.path(name)).unwrap_or_else(|| panic!("{name}"));
+    assert!(picked.iter().all(|c| c.path != fx.path("staged.txt")));
+    assert_eq!(by_name("added.txt").status, "added");
+    assert_eq!(by_name("bin.dat").diff, None);
+    let f = by_name("f.txt").diff.clone().unwrap();
+    assert!(f.starts_with("diff --git a/f.txt b/f.txt\n"), "{f}");
+    assert!(f.contains("-a\n+A\n") && !f.contains("+J"), "{f}");
+
+    // Nothing changed: the index, the working tree, no temporary index left behind.
+    assert_eq!(std::fs::read(fx.dir.join(".git/index")).unwrap(), index_before);
+    assert_eq!(fx.read("f.txt"), edited);
+    let leftovers: Vec<_> = std::fs::read_dir(fx.dir.join(".git"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("openidea-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // The size limit cuts at a line and says so.
+    let cut = repo.pending_changes(&options, 40, &utf8).unwrap();
+    let total: usize = cut.iter().filter_map(|c| c.diff.as_ref()).map(String::len).sum();
+    assert!(total <= 40 && cut.iter().any(|c| c.truncated));
+    assert!(cut.iter().filter_map(|c| c.diff.as_ref()).all(|d| d.is_empty() || d.ends_with('\n')));
+}
+
+#[test]
 fn partial_staging_with_built_patch() {
     let fx = Fixture::new();
     let base = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
@@ -1364,6 +1610,30 @@ fn status_reflects_external_changes_without_reopen() {
     assert!(repo.status().unwrap().is_empty());
     fx.git(&["checkout", "-q", "-b", "x"]);
     assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("x"));
+}
+
+#[test]
+fn branches_in_newly_written_packs_stay_visible() {
+    let fx = Fixture::new();
+    fx.write("a", "1\n");
+    fx.commit_all("a");
+    let repo = fx.repo();
+    assert_eq!(repo.branches().unwrap().len(), 1);
+
+    // An external pull: objects move into a pack the IDE has never seen, then a
+    // new branch points at a commit living only in that pack.
+    fx.write("a", "2\n");
+    fx.commit_all("b");
+    fx.git(&["repack", "-adq"]);
+    fx.git(&["checkout", "-q", "-b", "uat"]);
+    let uat = fx.git(&["rev-parse", "uat"]);
+    assert!(std::fs::read_dir(fx.path(".git/objects/pack")).unwrap().count() >= 2);
+
+    let names: Vec<String> = repo.branches().unwrap().into_iter().map(|b| b.name).collect();
+    assert!(names.contains(&"uat".to_string()), "branches: {names:?}, want uat at {uat}");
+
+    // Status peels HEAD for the tree-index diff: the same failure drops it too.
+    assert!(repo.status().is_ok(), "status failed: {:?}", repo.status().unwrap_err());
 }
 
 #[test]
@@ -1781,7 +2051,7 @@ fn smart_checkout_keeps_staged_changes_staged() {
     fx.write("f.txt", "1\n2\n3\n4\nlocal\n");
     fx.write("s.txt", "staged\n");
     fx.git(&["add", "s.txt"]);
-    let opts = CheckoutOptions { mode: CheckoutMode::Smart, diverged: None };
+    let opts = CheckoutOptions { mode: CheckoutMode::Smart, ..Default::default() };
     assert_eq!(repo.checkout_with("other", false, &opts).unwrap(), CheckoutOutcome::Done);
     assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("other"));
     assert_eq!(fx.read("f.txt"), "1\nother\n3\n4\nlocal\n");
@@ -1802,7 +2072,7 @@ fn checkout_reports_untracked_files_it_would_overwrite() {
     fx.write("dir/new.txt", "mine\n");
     let repo = fx.repo();
     for mode in [CheckoutMode::Normal, CheckoutMode::Smart] {
-        let opts = CheckoutOptions { mode, diverged: None };
+        let opts = CheckoutOptions { mode, ..Default::default() };
         let outcome = repo.checkout_with("other", false, &opts).unwrap();
         assert_eq!(outcome, CheckoutOutcome::UntrackedFiles { files: vec!["dir/new.txt".into()] });
         assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"));
@@ -1856,4 +2126,99 @@ fn reword_refuses_commits_outside_the_current_branch() {
     let side = fx.commit_all("side");
     fx.git(&["checkout", "-q", "main"]);
     assert!(fx.repo().reword(&side, "other").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn status_skips_a_directory_it_cannot_read() {
+    // `git status` warns "could not open directory: Permission denied" and lists the rest.
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    fx.write("a.txt", "a\n");
+    fx.commit_all("init");
+    fx.write("a.txt", "b\n");
+    fx.write("new.txt", "n\n");
+    let locked = fx.path("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("inside.txt"), "x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let st = fx.repo().status();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let st = st.unwrap();
+    assert_eq!(status_of(&st, "a.txt").unstaged, Some(ChangeKind::Modified));
+    assert_eq!(status_of(&st, "new.txt").unstaged, Some(ChangeKind::Untracked));
+}
+
+#[test]
+fn a_case_only_directory_rename_keeps_status_and_head_content() {
+    let fx = Fixture::new();
+    fx.write("src/financial/table/index.vue", "<template/>\n");
+    fx.commit_all("initial");
+    std::fs::rename(fx.path("src/financial"), fx.path("src/tmp")).unwrap();
+    std::fs::rename(fx.path("src/tmp"), fx.path("src/Financial")).unwrap();
+    if !fx.path("src/financial/table/index.vue").exists() {
+        return; // A case-sensitive file system: these are different directories.
+    }
+    fx.git(&["config", "core.ignorecase", "true"]);
+    fx.write("src/Financial/table/index.vue", "<template>x</template>\n");
+    fx.write("src/Financial/added/index.vue", "new\n");
+    let repo = fx.repo();
+    let st = repo.status().unwrap();
+    let modified = status_of(&st, "src/financial/table/index.vue");
+    assert_eq!(modified.unstaged, Some(ChangeKind::Modified));
+    // Tabs and the project tree name the file as the disk does.
+    assert_eq!(modified.path.0, fx.path("src/Financial/table/index.vue"));
+    assert_eq!(status_of(&st, "src/Financial/added/index.vue").path.0, fx.path("src/Financial/added/index.vue"));
+
+    let on_disk = fx.path("src/Financial/table/index.vue");
+    assert_eq!(repo.file_at(&on_disk, None, encoding_rs::UTF_8).unwrap().as_deref(), Some("<template/>\n"));
+    repo.stage(&[on_disk]).unwrap();
+    let st = repo.status().unwrap();
+    assert_eq!(status_of(&st, "src/financial/table/index.vue").staged, Some(ChangeKind::Modified));
+    assert_eq!(fx.git(&["diff", "--cached", "--name-only"]), "src/financial/table/index.vue");
+}
+
+#[test]
+fn status_paths_reads_only_the_named_paths() {
+    // The dirty-scope refresh: a watcher batch names a few paths, and git's pathspec
+    // filtering keeps the answer proportional to the batch instead of the whole tree.
+    let fx = Fixture::new();
+    fx.write("a.txt", "a\n");
+    fx.write("b.txt", "a\n");
+    fx.write("dir/c.txt", "a\n");
+    fx.commit_all("base");
+    fx.write("a.txt", "b\n");
+    fx.write("b.txt", "b\n");
+    fx.write("dir/c.txt", "b\n");
+    fx.write("new.txt", "n\n");
+    let repo = fx.repo();
+    repo.set_ignored_names(ide_core::settings::Settings::default().ignored_names());
+
+    let one = repo.status_paths(&[fx.path("a.txt")]).unwrap();
+    assert_eq!(one.len(), 1, "{one:#?}");
+    assert_eq!(one[0].rel_path, "a.txt");
+    assert_eq!(one[0].unstaged, Some(ChangeKind::Modified));
+
+    // A directory stands for everything below it, as the watcher reports a removed one.
+    let dir = repo.status_paths(&[fx.path("dir")]).unwrap();
+    assert_eq!(dir.iter().map(|s| s.rel_path.as_str()).collect::<Vec<_>>(), ["dir/c.txt"]);
+
+    // A nested file: the path a watcher hands over is spelled by the platform, and the pathspec
+    // needs `/` whatever the platform's separator is.
+    let nested = repo.status_paths(&[fx.path("dir").join("c.txt")]).unwrap();
+    assert_eq!(nested.iter().map(|s| s.rel_path.as_str()).collect::<Vec<_>>(), ["dir/c.txt"]);
+
+    // The repository root itself names everything, not a path called "".
+    assert_eq!(repo.status_paths(&[fx.path("")]).unwrap().len(), 4);
+
+    // A new file the batch names is reported as untracked, not as a directory entry.
+    let new = repo.status_paths(&[fx.path("new.txt")]).unwrap();
+    assert_eq!((new[0].rel_path.as_str(), new[0].unstaged), ("new.txt", Some(ChangeKind::Untracked)));
+
+    // Paths outside the repository are ignored rather than an error; nothing named is nothing read.
+    let outside = if cfg!(windows) { PathBuf::from("C:/elsewhere/x.txt") } else { PathBuf::from("/elsewhere/x.txt") };
+    assert!(repo.status_paths(&[outside]).unwrap().is_empty());
+
+    // An empty list is the full status, so a caller that lost the paths stays correct.
+    assert_eq!(repo.status_paths(&[]).unwrap().len(), 4);
 }

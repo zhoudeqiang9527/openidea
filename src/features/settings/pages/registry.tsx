@@ -1,4 +1,6 @@
 /** Registers the built-in pages as ordinary settings-page contributions and indexes their labels. */
+import { commands } from "@/platform/ipc";
+import { UPDATES_PAGE } from "./updates";
 import { onLanguageListChanged } from "@/platform/languageList";
 import { registerSettingsPage, type SettingsPageContribution } from "@/workbench/contributions";
 import { BEHAVIOR_PAGES } from "./behavior";
@@ -9,6 +11,7 @@ import { EXECUTION_PAGES } from "./execution";
 import { LANGUAGE_PAGES } from "./languages";
 import { OptionsPage } from "./OptionsPage";
 import { RUN_TARGET_PAGES } from "./runTargets";
+import { SCOPE_PAGES } from "./scopes";
 import { specLabels, type PageSpec } from "./spec";
 import { SSH_PAGES } from "./ssh";
 import { TOOLS_PAGES } from "./tools";
@@ -16,6 +19,8 @@ import { VCS_PAGES } from "./vcs";
 
 const BUILTIN_PAGES = [
   ...BEHAVIOR_PAGES,
+  ...SCOPE_PAGES,
+  UPDATES_PAGE,
   ...CORE_PAGES,
   ...EDITOR_PAGES,
   ...VCS_PAGES,
@@ -55,9 +60,17 @@ function toContribution(spec: PageSpec): SettingsPageContribution {
 }
 
 export function registerBuiltinPages(): () => void {
-  const disposers = BUILTIN_PAGES.map((spec) => registerSettingsPage(toContribution(spec)));
+  const disposers = BUILTIN_PAGES.filter((spec) => spec !== UPDATES_PAGE).map((spec) =>
+    registerSettingsPage(toContribution(spec)),
+  );
   // Code Style › <Language> pages come from the backend's language list, which plugins change.
   let live = true;
+  void commands
+    .appBuildInfo()
+    .then((info) => {
+      if (live && info.updates) disposers.push(registerSettingsPage(toContribution(UPDATES_PAGE)));
+    })
+    .catch(() => {});
   let languagePages: (() => void)[] = [];
   let generation = 0;
   const loadLanguagePages = () => {

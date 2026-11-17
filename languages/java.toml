@@ -14,6 +14,10 @@ class Scratch {
 }
 '''
 
+# Rainbow brackets › angle: editor syntax nodes whose `<` `>` pair up (never comparisons).
+[rainbow-brackets]
+angle = ["TypeArguments", "TypeParameters"]
+
 # Microsoft java-debug runs inside jdtls as a bundle (`initializationOptions.bundles`,
 # added when installed); sessions start with `vscode.java.startDebugSession` and the
 # client connects to the returned port (`debugServer`).
@@ -27,7 +31,7 @@ install-hint = "Install Microsoft java-debug (Settings › Languages & Framework
 name = "jdtls"
 command = "jdtls"
 root-markers = ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.xml", ".project"]
-install-hint = "Install Eclipse JDT Language Server (brew install jdtls, or https://github.com/eclipse-jdtls/eclipse.jdt.ls); requires JDK 21+"
+install-hint = "Install Eclipse JDT Language Server (brew install jdtls, or https://github.com/eclipse-jdtls/eclipse.jdt.ls); runs on a JDK new enough for the installed release, chosen or downloaded automatically"
 
 [language-servers.initialization-options]
 bundles = []
@@ -36,6 +40,9 @@ bundles = []
 # Library classes open as `jdt://` virtual documents (`java/classFileContents`).
 classFileContentsSupport = true
 resolveAdditionalTextEditsSupport = true
+# Move (F6) code actions run the client-side refactoring command; the IDE asks for the
+# destination and requests the edit (`java/getMoveDestinations`, `java/move`).
+moveRefactoringSupport = true
 
 [language-servers.initialization-options.settings.java]
 autobuild = { enabled = true }
@@ -43,7 +50,11 @@ contentProvider = { preferred = "fernflowerContentProvider" }
 maven = { downloadSources = true, updateSnapshots = false }
 eclipse = { downloadSources = true }
 references = { includeDecompiledSources = true }
+# The editor's usage lenses count usages; the server's own lenses would search every
+# declaration of the file again, all at once (on by default in JDT LS).
+referencesCodeLens = { enabled = false }
 signatureHelp = { enabled = true }
+symbols = { includeGeneratedCode = true }
 configuration = { updateBuildConfiguration = "automatic" }
 project = { referencedLibraries = ["lib/**/*.jar"] }
 # Generated code (implement methods, getters, toString…) indents like the editor (`indent` above).
@@ -58,3 +69,10 @@ generatesMetadataFilesAtProjectRoot = false
 exclusions = ["**/node_modules/**", "**/.metadata/**", "**/archetype-resources/**", "**/META-INF/maven/**"]
 maven = { enabled = true }
 gradle = { enabled = true, wrapper = { enabled = true } }
+
+[[language-servers]]
+name = "kmp-lsp"
+fallback = true
+command = "kmp-lsp"
+root-markers = ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.xml", ".project"]
+install-hint = "Install kmp-lsp in Settings › Languages & Frameworks › Language Servers (https://github.com/Hessesian/kmp-lsp)"

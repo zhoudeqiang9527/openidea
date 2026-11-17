@@ -280,6 +280,32 @@ fn spring_boot_application_of_a_repository_nested_one_or_two_levels_down() {
 }
 
 #[test]
+fn a_large_common_module_does_not_starve_later_app_modules() {
+    // More source files than one scan budget in `a-common` (no app class): the app in `b-app` must still be found.
+    let mut files: Vec<(String, String)> = vec![
+        ("pom.xml".into(), "<project><modules><module>a-common</module><module>b-app</module></modules></project>".into()),
+        ("a-common/pom.xml".into(), BOOT_POM.into()),
+        ("b-app/pom.xml".into(), BOOT_POM.into()),
+        (
+            "b-app/src/main/java/demo/App.java".into(),
+            "package demo;\n@SpringBootApplication\npublic class App {\n  public static void main(String[] args) {}\n}\n".into(),
+        ),
+    ];
+    for i in 0..401 {
+        files.push((format!("a-common/src/main/java/demo/C{i}.java"), format!("package demo;\nclass C{i} {{}}\n")));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for (path, content) in &files {
+        let p = dir.path().join(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+    let configs = detect(dir.path());
+    let app = find(&configs, "application:b-app:demo.App");
+    assert_eq!(app.kind, "spring-boot");
+}
+
+#[test]
 fn nested_builds_of_every_kind_and_depth() {
     let dir = project(&[
         ("services/api/settings.gradle.kts", "include(\"app\")"),
@@ -650,6 +676,130 @@ fn cmake_detection_is_read_only_and_preserves_existing_build_directories() {
     assert_eq!(test.extras.before_launch[0].target, build.id);
 }
 
+fn cmake_reply(root: &Path, dir: &str, configurations: &[(&str, &[&str])]) {
+    let reply = root.join(dir).join(".cmake/api/v1/reply");
+    fs::create_dir_all(&reply).unwrap();
+    fs::write(root.join(dir).join("CMakeCache.txt"), "").unwrap();
+    let write = |name: &str, value: serde_json::Value| fs::write(reply.join(name), value.to_string()).unwrap();
+    write(
+        "index-1.json",
+        serde_json::json!({
+            "objects": [{"kind": "codemodel", "version": {"major": 2}, "jsonFile": "model.json"}]
+        }),
+    );
+    let configurations: Vec<_> = configurations
+        .iter()
+        .map(|(configuration, targets)| {
+            let targets: Vec<_> = targets
+                .iter()
+                .map(|target| {
+                    let file = format!("{configuration}-{target}.json");
+                    write(
+                        &file,
+                        serde_json::json!({
+                            "name": target, "type": "EXECUTABLE", "artifacts": [{"path": target}]
+                        }),
+                    );
+                    serde_json::json!({"jsonFile": file})
+                })
+                .collect();
+            serde_json::json!({"name": configuration, "targets": targets})
+        })
+        .collect();
+    write("model.json", serde_json::json!({"paths": {"source": root}, "configurations": configurations}));
+}
+
+#[test]
+fn cmake_names_only_include_context_that_distinguishes_duplicates() {
+    for configuration in ["", "Debug"] {
+        let root = project(&[("CMakeLists.txt", "project(demo)")]);
+        cmake_reply(root.path(), "build", &[(configuration, &["hello", "other"])]);
+        let single = detect(root.path());
+        let expected = ["CMake Configure", "CMake Build", "CTest", "Build hello", "hello", "Build other", "other"];
+        assert_eq!(single.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), expected);
+        assert_eq!(find(&single, &format!("cmake:build:{configuration}:hello")).name, "hello");
+
+        cmake_reply(root.path(), "build-debug", &[(configuration, &["hello", "unique"])]);
+        let multiple = detect(root.path());
+        let context = if configuration.is_empty() { "build/" } else { "Debug · build/" };
+        assert_eq!(find(&multiple, &format!("cmake:build:{configuration}:hello")).name, format!("hello [{context}]"));
+        assert_eq!(
+            find(&multiple, &format!("cmake:build:{configuration}:hello:build")).name,
+            format!("Build hello [{context}]")
+        );
+        let context = if configuration.is_empty() { "build-debug/" } else { "Debug · build-debug/" };
+        assert_eq!(
+            find(&multiple, &format!("cmake:build-debug:{configuration}:hello")).name,
+            format!("hello [{context}]")
+        );
+        for (id, name) in [("configure", "CMake Configure"), ("build", "CMake Build"), ("test", "CTest")] {
+            for dir in ["build", "build-debug"] {
+                assert_eq!(find(&multiple, &format!("cmake:{dir}:{id}")).name, format!("{name} [{dir}/]"));
+            }
+        }
+        assert_eq!(find(&multiple, &format!("cmake:build:{configuration}:other")).name, "other");
+        assert_eq!(find(&multiple, &format!("cmake:build-debug:{configuration}:unique")).name, "unique");
+        for mut config in single {
+            let renamed = find(&multiple, &config.id);
+            config.name = renamed.name.clone();
+            assert_eq!(&config, renamed, "only names may change when another directory appears");
+        }
+    }
+}
+
+#[test]
+fn cmake_multiconfig_names_use_configuration_without_redundant_directory() {
+    let root = project(&[("CMakeLists.txt", "project(demo)")]);
+    cmake_reply(root.path(), "build", &[("Debug", &["hello"]), ("Release", &["hello"])]);
+    let configs = detect(root.path());
+    for configuration in ["Debug", "Release"] {
+        assert_eq!(
+            find(&configs, &format!("cmake:build:{configuration}:hello")).name,
+            format!("hello [{configuration}]")
+        );
+        assert_eq!(
+            find(&configs, &format!("cmake:build:{configuration}:hello:build")).name,
+            format!("Build hello [{configuration}]")
+        );
+    }
+    assert_eq!(find(&configs, "cmake:build:build").name, "CMake Build");
+}
+
+#[test]
+fn cmake_profile_names_disambiguate_before_adding_directory_locations() {
+    use ide_core::settings::CMakeProfile;
+    let root = project(&[("CMakeLists.txt", "project(demo)")]);
+    cmake_reply(root.path(), "out/debug", &[("Debug", &["hello"])]);
+    cmake_reply(root.path(), "out/release", &[("Release", &["hello"])]);
+    for same_name in [false, true] {
+        let profiles = [
+            CMakeProfile { name: "Development".into(), build_dir: "out/debug".into(), ..Default::default() },
+            CMakeProfile {
+                name: if same_name { "Development" } else { "Production" }.into(),
+                build_type: "Release".into(),
+                build_dir: "out/release".into(),
+                ..Default::default()
+            },
+        ];
+        let configs = ide_run::detect_with_profiles(root.path(), &[], Some(&profiles));
+        for (index, profile) in profiles.iter().enumerate() {
+            let context =
+                if same_name { format!("{} · {}/", profile.name, profile.build_dir) } else { profile.name.clone() };
+            for (id, name) in [("configure", "CMake Configure"), ("build", "CMake Build"), ("test", "CTest")] {
+                assert_eq!(find(&configs, &format!("cmake:profile:{index}:{id}")).name, format!("{name} [{context}]"));
+            }
+            assert_eq!(
+                find(&configs, &format!("cmake:profile:{index}:{}:hello", profile.build_type)).name,
+                format!("hello [{context}]")
+            );
+            assert_eq!(
+                find(&configs, &format!("cmake:profile:{index}:{}:hello:build", profile.build_type)).name,
+                format!("Build hello [{context}]")
+            );
+        }
+    }
+}
+
 #[test]
 fn cmake_configures_before_the_first_build() {
     let dir = project(&[("CMakeLists.txt", "project(demo)")]);
@@ -667,7 +817,7 @@ fn cmake_ignores_malformed_file_api_replies() {
     ]);
     let configs = detect(dir.path());
     assert_eq!(configs.iter().filter(|c| c.kind == "cmake").count(), 3);
-    assert!(!configs.iter().any(|c| c.kind == "native"));
+    assert!(!configs.iter().any(|c| c.kind == "cmake-application"));
 }
 
 #[test]
@@ -763,7 +913,7 @@ fn cmake_profiles_control_commands_names_and_environment() {
             "",
         ]);
         assert_eq!(configure.args, expected);
-        assert_eq!(configure.name, "CMake Configure (output dir)");
+        assert_eq!(configure.name, "CMake Configure");
         let build = find(&configs, "cmake:profile:0:build");
         assert_eq!(build.args, ["--build", "output dir", "--config", "Release", "-j", "8", "--", "VERBOSE=1"]);
         assert_eq!(build.extras.before_launch[0].target, configure.id);
@@ -825,6 +975,27 @@ fn php_phpunit_project() {
     assert_eq!(phpunit.debug_adapter.as_deref(), Some("php-debug"));
     assert!(find(&c, "composer:test").is_test);
     assert!(!find(&c, "composer:lint").is_test);
+}
+
+#[test]
+fn php_pest_project() {
+    let dir = project(&[
+        ("composer.json", r#"{"require-dev":{"pestphp/pest":"^3"}}"#),
+        ("phpunit.xml", "<phpunit/>"),
+        ("vendor/bin/phpunit", ""),
+        ("vendor/bin/phpunit.bat", ""),
+        ("vendor/bin/pest", ""),
+        ("vendor/bin/pest.bat", ""),
+    ]);
+    let c = detect(dir.path());
+    let pest = find(&c, "phpunit");
+    assert_eq!(pest.name, "Pest");
+    assert_eq!(cmdline(pest), if cfg!(windows) { "vendor/bin/pest.bat" } else { "vendor/bin/pest" });
+    assert_eq!(pest.kind, "phpunit");
+    assert!(pest.is_test);
+    assert_eq!(pest.debug_adapter.as_deref(), Some("php-debug"));
+    let dir = project(&[("composer.json", r#"{"require-dev":{"pestphp/pest":"^3"}}"#)]);
+    assert_eq!(find(&detect(dir.path()), "phpunit").name, "PHPUnit");
 }
 
 #[test]
@@ -892,6 +1063,7 @@ task default: :build
     assert_eq!(cmdline(find(&c, "rspec")), "bundle exec rspec");
     assert!(find(&c, "rspec").is_test);
     assert_eq!(find(&c, "rake:build").extras.folder.as_deref(), Some("Rake"));
+    assert!(c.iter().all(|c| c.debug_adapter.as_deref() == Some("rdbg")));
 }
 
 #[test]
@@ -906,6 +1078,7 @@ fn ruby_minitest_projects_get_a_test_runner() {
         ("bundle", &["exec", "ruby", "-Ilib", "-Itest"].map(String::from)[..])
     );
     assert_eq!(m.args.last().map(String::as_str), Some("test"));
+    assert_eq!(m.debug_adapter.as_deref(), Some("rdbg"));
     // A `test` Rake task or RSpec already runs the tests.
     let dir = project(&[("Rakefile", "task :test\n"), ("test/a_test.rb", "")]);
     assert!(!ids(&detect(dir.path())).contains(&"minitest"));
@@ -966,4 +1139,88 @@ fn cmake_subdirectories_are_not_independent_builds() {
         ("lib/CMakeLists.txt", "add_library(lib lib.cpp)"),
     ]);
     assert!(detect(dir.path()).iter().filter(|c| c.kind == "cmake").all(|c| c.cwd.is_none()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_django_project_in_src_uses_the_environment_next_to_it() {
+    let dir = project(&[("pyproject.toml", ""), (".venv/bin/python", ""), ("src/manage.py", "")]);
+    let c = detect(dir.path());
+    let python = dir.path().join(".venv/bin/python").to_string_lossy().into_owned();
+    let server = find(&c, "django:runserver:src");
+    assert_eq!(cmdline(server), format!("{python} manage.py runserver"));
+    assert_eq!(server.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).as_deref(), Some("src"));
+    assert_eq!(cmdline(find(&c, "django:test:src")), format!("{python} manage.py test"));
+
+    let dir = project(&[("pyproject.toml", ""), ("uv.lock", ""), ("src/manage.py", "")]);
+    assert_eq!(cmdline(find(&detect(dir.path()), "django:runserver:src")), "uv run python manage.py runserver");
+
+    // Its own environment wins, and nothing above the opened project is used.
+    let dir = project(&[(".venv/bin/python", ""), ("app/manage.py", ""), ("app/poetry.lock", "")]);
+    assert_eq!(cmdline(find(&detect(dir.path()), "django:runserver:app")), "poetry run python manage.py runserver");
+    let dir = project(&[(".venv/bin/python", ""), ("app/manage.py", "")]);
+    let c = detect(&dir.path().join("app"));
+    assert_eq!(cmdline(find(&c, "django:runserver")), "python3 manage.py runserver");
+
+    // A folder borrowing the root's environment isn't a pytest project because pytest is installed there.
+    let dir = project(&[
+        ("pyproject.toml", ""),
+        (".venv/bin/python", ""),
+        (".venv/bin/pytest", ""),
+        ("docs/requirements.txt", ""),
+    ]);
+    let c = detect(dir.path());
+    assert!(c.iter().any(|c| c.id == "pytest"));
+    assert!(!c.iter().any(|c| c.id.starts_with("pytest:")), "{:?}", c.iter().map(|c| &c.id).collect::<Vec<_>>());
+}
+
+#[test]
+fn rebar3_projects() {
+    let dir = project(&[("rebar.config", "{erl_opts, [debug_info]}.\n"), ("src/app.erl", "-module(app).\n")]);
+    let c = detect(dir.path());
+    assert_eq!(ids(&c), ["rebar3:shell", "rebar3:eunit"]);
+    assert_eq!(cmdline(&c[0]), "rebar3 shell");
+    assert!(c[1].is_test);
+
+    // Common Test suites in an umbrella app; the project's own rebar3 script.
+    let dir = project(&[
+        ("rebar.config", ""),
+        ("rebar3", "#!/usr/bin/env escript\n"),
+        ("apps/core/test/core_SUITE.erl", "-module(core_SUITE).\n"),
+    ]);
+    let c = detect(dir.path());
+    assert_eq!(ids(&c), ["rebar3:shell", "rebar3:eunit", "rebar3:ct"]);
+    if !cfg!(windows) {
+        assert_eq!(cmdline(find(&c, "rebar3:ct")), "./rebar3 ct");
+    }
+}
+
+#[test]
+fn mix_projects() {
+    let dir = project(&[("mix.exs", "defmodule App.MixProject do\n  defp deps, do: []\nend\n")]);
+    let c = detect(dir.path());
+    assert_eq!(ids(&c), ["mix:iex", "mix:test"]);
+    assert_eq!(cmdline(&c[0]), "iex -S mix");
+    assert!(c[1].is_test);
+
+    let dir = project(&[("mix.exs", "defp deps do\n  [{:phoenix, \"~> 1.7\"}]\nend\n")]);
+    assert_eq!(cmdline(&detect(dir.path())[0]), "iex -S mix phx.server");
+}
+
+#[test]
+fn sbt_projects() {
+    let dir = project(&[
+        ("build.sbt", "lazy val core = project\n"),
+        ("core/build.sbt", "libraryDependencies += \"a\" % \"b\" % \"1\"\n"),
+        ("core/src/main/scala/App.scala", "object App\n"),
+    ]);
+    let c = detect(dir.path());
+    assert_eq!(ids(&c), ["sbt:run", "sbt:test"]);
+    assert_eq!(cmdline(&c[0]), "sbt run");
+    assert!(c[1].is_test && c.iter().all(|c| c.kind == "sbt"));
+
+    let dir = project(&[("build.sbt", ""), ("sbt", "#!/bin/sh\n")]);
+    if !cfg!(windows) {
+        assert_eq!(cmdline(&detect(dir.path())[1]), "./sbt test");
+    }
 }

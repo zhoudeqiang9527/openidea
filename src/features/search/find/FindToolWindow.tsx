@@ -1,3 +1,4 @@
+import { menuGroupItems } from "@/workbench/contributions";
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
@@ -174,24 +175,30 @@ export function FindTabs() {
         id: String(t.id),
         label: t.title,
         closable: true,
-        icon: t.pinned ? "pin" : undefined,
+        pinned: t.pinned,
       }))}
       activeId={String(tab.id)}
       onSelect={(id) => useFindWindow.setState({ active: Number(id) })}
       onClose={(id) => closeFindTab(Number(id))}
+      onTogglePin={(id) => {
+        const t = tabs.find((x) => x.id === Number(id));
+        if (t) pinFindTab(t.id, !t.pinned);
+      }}
       onContextMenu={(id, e) => {
         const t = tabs.find((x) => x.id === Number(id));
         if (!t) return;
+        // IDEA's content tab menu.
         showContextMenu(e, [
-          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinFindTab(t.id, !t.pinned) },
-          { kind: "separator" },
           { id: "close", label: "Close Tab", run: () => closeFindTab(t.id) },
+          { id: "closeAll", label: "Close All Tabs", run: () => tabs.forEach((o) => closeFindTab(o.id)) },
           {
             id: "closeOthers",
             label: "Close Other Tabs",
             disabled: tabs.length < 2,
             run: () => tabs.forEach((o) => o.id !== t.id && closeFindTab(o.id)),
           },
+          { kind: "separator" },
+          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinFindTab(t.id, !t.pinned) },
         ]);
       }}
     />
@@ -369,7 +376,7 @@ function FindTabView({ tab }: { tab: FindTab }) {
   return (
     <div className={styles.body} onKeyDown={onKeyDown}>
       <div className={styles.summary}>
-        {(st.status === "searching" || busy) && <Spinner size={12} />}
+        {(st.status === "searching" || busy) && <Spinner size={16} variant="spokes" />}
         <span className={styles.title}>{tab.title}</span>
         <span className={styles.count}>
           {st.status === "invalid" || st.status === "error"
@@ -417,7 +424,12 @@ function FindTabView({ tab }: { tab: FindTab }) {
           </>
         )}
       </div>
-      <SplitGroup orientation="horizontal" className={styles.split} id="find-results-split">
+      <SplitGroup
+        orientation="horizontal"
+        className={styles.split}
+        id="find-results-split"
+        storageKey={showPreview ? "openidea.find.previewSplit" : undefined}
+      >
         <SplitPanel id="results" minSize={120} className={styles.splitPanel}>
           <Tree<Node>
             className={styles.tree}
@@ -459,6 +471,9 @@ function FindTabView({ tab }: { tab: FindTab }) {
               const groups = [...sel].flatMap((k) => (byKey.get(k) ? nodeGroups(byKey.get(k)!) : []));
               const excludedAll = groups.length > 0 && groups.every((g) => groupState(g, marks) === "excluded");
               showContextMenu(e, [
+                ...(_n?.kind === "match"
+                  ? menuGroupItems("searchResults", { paths: [_n.path], line: _n.line, column: _n.col })
+                  : []),
                 {
                   id: "exclude",
                   label: excludedAll ? "Include" : "Exclude",
@@ -520,7 +535,7 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
     case "dir":
       return (
         <span className={styles.node}>
-          <Icon name={state.expanded ? "folder-open" : "folder"} size={14} className={styles.icon} />
+          <Icon name={state.expanded ? "folder-open" : "folder"} size={16} className={styles.icon} />
           <span className={styles.label}>{node.label}</span>
           <span className={styles.meta}>
             {node.count} {node.count === 1 ? "match" : "matches"}
@@ -530,7 +545,7 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
     case "file":
       return (
         <span className={styles.node}>
-          <Icon name={fileIconName(node.name)} size={14} className={styles.icon} />
+          <Icon name={fileIconName(node.name)} size={16} className={styles.icon} />
           <span className={styles.label}>{node.name}</span>
           <span className={styles.meta}>{node.count}</span>
           {!state.depth && node.dir && <span className={styles.meta}>{node.dir}</span>}

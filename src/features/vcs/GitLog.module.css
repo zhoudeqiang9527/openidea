@@ -35,7 +35,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 4px 2px;
   border-right: 1px solid var(--border);
 }
@@ -52,7 +52,7 @@
   height: 32px;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 0 6px;
 }
 .branchSearch {
@@ -60,13 +60,22 @@
   min-width: 60px;
 }
 .branchTree {
+  --tree-detail-flex-shrink: 0;
   flex: 1;
   min-height: 0;
+}
+.branchDetail {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  line-height: 1;
+  vertical-align: middle;
 }
 
 /* filters */
 .filters {
-  gap: 4px;
+  gap: var(--space-1);
   padding: 0 8px 0 6px;
   min-width: 0;
   overflow: hidden;
@@ -81,7 +90,7 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   overflow: hidden;
 }
 .filterHidden {
@@ -161,6 +170,8 @@
   min-height: 0;
   overflow: auto;
   outline: none;
+  /* Rows coming and going while scrolling relay out the list alone, not the workbench. */
+  contain: strict;
 }
 .row {
   position: absolute;
@@ -170,7 +181,7 @@
   height: 26px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   padding: 0 8px;
   white-space: nowrap;
   cursor: default;
@@ -196,13 +207,24 @@
   position: relative;
   padding-inline-end: 6px;
   cursor: grab;
+  touch-action: none;
+}
+.columnHeading.dragSource {
+  cursor: grabbing;
+  opacity: 0.6;
+}
+.columnHeading.dropBefore {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.columnHeading.dropAfter {
+  box-shadow: inset -2px 0 0 var(--accent);
 }
 .columnResize {
   position: absolute;
   inset-block: 0;
   inset-inline-end: 0;
   width: 6px;
-  cursor: col-resize;
+  cursor: ew-resize;
   touch-action: none;
 }
 .columnResize:focus-visible {
@@ -217,6 +239,9 @@
 .row:hover {
   background: var(--bg-tree-hover);
 }
+.list[data-hover-paused] .row:not(.columnHeader):hover {
+  background: var(--log-row-bg, transparent);
+}
 .selected,
 .selected:hover {
   --log-row-bg: var(--bg-tree-selected-inactive);
@@ -230,7 +255,7 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   /* Let graph endpoints overlap adjacent rows, but never paint over the next column. */
   overflow-x: clip;
   overflow-y: visible;
@@ -284,8 +309,10 @@
   min-width: 11px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  max-width: 50%;
+  gap: var(--space-2);
+  /* May use the whole subject cell when space allows (#2447); shrinks with
+     per-label ellipsis before crowding out the commit message. */
+  max-width: 100%;
   overflow: hidden;
   margin-left: auto;
 }
@@ -296,14 +323,15 @@
   --tag-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M1.5 1.5h4.2l4.8 4.8-4.2 4.2-4.8-4.8z' fill='none' stroke='black' stroke-width='1.1' stroke-linejoin='round'/%3E%3Ccircle cx='4' cy='4' r='.9'/%3E%3C/svg%3E");
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   font-size: var(--fs-ui);
   color: var(--fg-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
-  max-width: 180px;
+  /* Sizes to content (#2447): truncates with ellipsis only when .refs runs
+     out of room; the full name stays available via the title tooltip. */
 }
 /* Outlined tag glyph in the ref's colour. */
 .ref::before {
@@ -358,13 +386,25 @@
 .fileRow {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
 }
 .fileIcon {
   flex: none;
+}
+.iconStack {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.iconOverlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
 }
 .fileName {
   min-width: 0;
@@ -379,7 +419,7 @@
 }
 .lineStats {
   display: inline-flex;
-  gap: 6px;
+  gap: var(--space-1-5);
   flex: none;
   font-variant-numeric: tabular-nums;
 }
@@ -415,6 +455,54 @@
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+/* Go to a merge commit's file: parent 1 | merge result | parent 2, each pane scrolling itself. */
+.mergeDiff {
+  flex: 1;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.mergeDiffLabels {
+  flex: none;
+  height: var(--h-row);
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-secondary);
+  font-size: var(--fs-small);
+}
+.mergeDiffLabels > span {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.mergeDiffLabels > span + span {
+  border-left: 1px solid var(--border);
+}
+.mergeDiffPanes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+}
+.mergeDiffPane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.mergeDiffPane + .mergeDiffPane {
+  border-left: 1px solid var(--border);
+}
+.mergeDiffPane > :global(.cm-editor) {
+  flex: 1;
+  min-width: 0;
 }
 .subjectLine {
   color: var(--fg-strong);
@@ -552,7 +640,11 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
+}
+/* A branch inside an opened Local / Remote group. */
+.branchFilterNested {
+  padding-left: var(--tree-indent, 16px);
 }
 .branchFilterIcon {
   flex: none;
@@ -593,13 +685,12 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   padding: 4px 6px;
 }
 .worktreeList {
   flex: 1;
   min-height: 0;
-  overflow: auto;
 }
 
 .colRepository {

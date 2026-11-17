@@ -2,13 +2,23 @@
  * Commit tool window: change list with inclusion checkboxes, message, stashes. Its
  * parts also make the Git window's Local Changes / Stash tabs and the Commit dialog.
  */
+import { writeClipboardText } from "@/platform/clipboard";
 import { useWorkflowSettings } from "@/platform/workflowSettings";
-import { formatBinding, isMacHost } from "@/platform/keymap";
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent } from "react";
-import { tx } from "@/platform/i18n";
+import { formatBinding, isMacHost, macStroke, normalizeBinding, shortcutLabel, strokeOf } from "@/platform/keymap";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type PointerEvent,
+} from "react";
+import { tx, txTemplate } from "@/platform/i18n";
 import clsx from "clsx";
 import { executeAction } from "@/platform/actions";
-import { dirname } from "@/platform/project";
+import { basename, dirname } from "@/platform/project";
 import { isTestFile, useEffectiveRoots } from "@/platform/projectRoots";
 import {
   Button,
@@ -28,31 +38,38 @@ import {
   registerDropTarget,
   showContextMenu,
   startPointerDrag,
+  tooltipAttrs,
   type MenuItem,
   type TabItem,
   type TreeHandle,
   T,
 } from "@/ui";
-import { editorService } from "@/workbench/contributions";
+import {
+  editorService,
+  maybeEditorService,
+  menuGroupItems,
+  type EditorInput,
+  useMenuSlotItems,
+} from "@/workbench/contributions";
+import { evaluateWhen, useContextKeys } from "@/platform/context";
 import { useToolWindowLayout } from "@/workbench/toolwindows/store";
 import {
   aggregateCheck,
   buildChangeTree,
   checkOf,
   filesOf,
-  groupFileNodes,
   groupOf,
   ignoreTargets,
   isPartiallyStaged,
   planCommit,
-  stagingSide,
   toggledCheck,
   type ChangeNode,
 } from "./changes";
 import { applyStash, commitChanges, deleteFiles, dropStash, showUnstashDialog, stashChanges } from "./changeOps";
 import { CommitOptionsPopup } from "./CommitOptions";
 import { DEFAULT_LIST_NAME, useChangelists, withListDefaults } from "./changelists";
-import { commitFiles, moveToChangelist } from "./changelistsUi";
+import { inclusionChecks, isCommitAll, useStagingArea } from "./staging";
+import { addToChangelist, commitFiles } from "./changelistsUi";
 import { acceptSide } from "./conflictsUi";
 import { copyChangesAsPatch } from "./patches";
 import {
@@ -62,24 +79,39 @@ import {
   setCommitDiffPreview,
   setDiffPreview,
   setGroupByDir,
+  setGroupByRepo,
   setGroupByStaging,
+  setShowUnversionedSeparately,
   useCommit,
   type CommitTab,
 } from "./commitStore";
 import { pushAfterCommit } from "./commitUi";
 import { rebaseAfterFixup } from "./rebase";
 import { stashTabOf, stashTabs, type ContentTab } from "./gitTabs";
-import { diffInput, openDiff, withChain, workingDiffData } from "./diffInput";
+import {
+  DIFF_KIND,
+  changeNodeDiff,
+  changeNodeDiffData,
+  changeTreeDiffData,
+  diffInput,
+  openDiff,
+  openVcsDiff,
+  opensDiffOnActivate,
+  vcsDiffInFront,
+  workingDiffData,
+} from "./diffInput";
 import { DiffEditor } from "./DiffEditor";
 import { KIND_COLOR, KIND_LABEL, fileCount, formatTime, stashLabel, stripSlash } from "./model";
 import { call, commands } from "@/platform/ipc";
 import type { FileStatus } from "@/bindings";
 import { OperationBanner } from "./operations";
+import { runOp } from "./ops";
 import { ShelfPanel, loadShelves, useShelf } from "./shelf";
 import { refreshNow, repoName, selectRepo, useVcs } from "./store";
+import { saveVcsSetting } from "./settingsUi";
 import styles from "./CommitView.module.css";
 
-/** MIME type of changed files dragged between change lists (absolute paths, newline-separated). */
+/** MIME type of files dragged onto a change list (absolute paths, newline-separated). */
 const CHANGES_MIME = "application/x-openidea-changes";
 
 /** Shown text of a node: group names are translated, except the names of user change lists. */
@@ -162,12 +194,12 @@ export function StashContent({ tab }: { tab: CommitTab }) {
   const combine = useWorkflowSettings((s) => s.vcs.git.combineStashAndShelf);
   if (combine)
     return (
-      <SplitGroup orientation="vertical" className={styles.split}>
-        <SplitPanel defaultSize="50%" minSize="80px">
+      <SplitGroup orientation="vertical" className={styles.split} storageKey="openidea.vcs.stashShelfSplit">
+        <SplitPanel id="stashes" defaultSize="50%" minSize="80px">
           <StashesPanel />
         </SplitPanel>
         <SplitHandle />
-        <SplitPanel defaultSize="50%" minSize="80px">
+        <SplitPanel id="shelf" defaultSize="50%" minSize="80px">
           <ShelfPanel />
         </SplitPanel>
       </SplitGroup>
@@ -182,12 +214,46 @@ const bottomLeft = (el: HTMLElement) => {
   return { x: r.left, y: r.bottom + 2 };
 };
 
-/** Opens a file's diff; F7 continues through the other files of its group, in tree order. */
-function openNode(n: ChangeNode, roots: readonly ChangeNode[]) {
+/**
+ * Activates a change (Enter, double-click, Show Diff); F7 continues through the other
+ * files of its group, in tree order (Enter and double-click: of the whole tree, on into the
+ * unversioned files, as IDEA's Commit diff preview). Enter and double-click follow IDEA's Show on
+ * Double-Click (opensDiffOnActivate): the source file, or the diff where the commit
+ * interface puts it (openVcsDiff: a preview editor tab, or under the modal interface the
+ * front diff window, behind the modal Commit dialog, #1863). `forceDiff` is Show Diff and
+ * the Commit dialog's own activation, which always show the diff in front.
+ */
+function openNode(n: ChangeNode, roots: readonly ChangeNode[], forceDiff = false) {
   if (n.type !== "file" || !n.path) return;
-  const nodes = groupFileNodes(roots, n);
-  const items = nodes.map((f) => workingDiffData(f.path!, undefined, stagingSide(f.group, f.files[0]!)));
-  void openDiff(withChain(items, Math.max(0, nodes.indexOf(n))), { preview: true });
+  if (!forceDiff && !opensDiffOnActivate()) {
+    void editorService().openFile(n.path, { focus: true });
+    return;
+  }
+  void openVcsDiff((forceDiff ? changeNodeDiffData : changeTreeDiffData)(roots, n), { preview: true });
+}
+
+/** The setting behind Show on Double-Click (`None` follows the commit interface). */
+export const DOUBLE_CLICK_KEY = "vcs.commit.doubleClickOpensDiff";
+
+/**
+ * IDEA's Show on Double-Click: the change lists' View Options items. An unset value
+ * (Follow the Interface) is written as `null`, which removes the key from the settings.
+ */
+export function doubleClickMenu(value: boolean | null | undefined): MenuItem[] {
+  const on = value ?? null;
+  const set = (v: boolean | null) => () => void saveVcsSetting(DOUBLE_CLICK_KEY, v);
+  return [
+    { kind: "separator" },
+    {
+      label: tx("Show on Double-Click"),
+      submenu: [
+        { label: tx("Follow the Interface"), checked: on === null, run: set(null) },
+        { kind: "separator" },
+        { label: tx("Diff"), checked: on === true, run: set(true) },
+        { label: tx("Source"), checked: on === false, run: set(false) },
+      ],
+    },
+  ];
 }
 
 /** Context menu of a change list's header: the list's own actions, then the bulk ones on its files. */
@@ -213,13 +279,13 @@ export function listMenu(id: string, active: boolean, files: readonly FileStatus
       label: "Stage",
       icon: "plus",
       disabled: !files.some((f) => f.unstaged),
-      run: () => void call(commands.vcsStage(paths)).finally(() => void refreshNow()),
+      run: () => void runOp(tx`Stage ${count} files`, () => call(commands.vcsStage(paths))),
     },
     {
       label: "Unstage",
       icon: "minus",
       disabled: !files.some((f) => f.staged),
-      run: () => void call(commands.vcsUnstage(paths)).finally(() => void refreshNow()),
+      run: () => void runOp(tx`Unstage ${count} files`, () => call(commands.vcsUnstage(paths))),
     },
     { kind: "separator" },
     ...(count
@@ -233,13 +299,31 @@ export function listMenu(id: string, active: boolean, files: readonly FileStatus
 
 /** Paths Delete… applies to: only when every selected file is unversioned (versioned ones are rolled back). */
 /** The selected files that still exist in the working tree (Delete… removes them from disk). */
+/** Whether the change leaves the file in the working tree. */
+const onDisk = (f: FileStatus) => f.unstaged !== "deleted" && !(f.staged === "deleted" && !f.unstaged);
+
 export function deletableFiles(nodes: ChangeNode[]): string[] {
   const files = filesOf(nodes);
-  const onDisk = (f: FileStatus) => f.unstaged !== "deleted" && !(f.staged === "deleted" && !f.unstaged);
   return files.length && files.every(onDisk) ? files.map((f) => f.path) : [];
 }
 
-export function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuItem[] {
+/**
+ * Copies the selected files' absolute paths (`absolute`) or just their names
+ * (`name`) to the clipboard, one per line: Ctrl+C / Ctrl+Shift+C of the changes
+ * tree and the context menu's Copy items (#1877).
+ */
+export function copyChangePaths(nodes: ChangeNode[], kind: "absolute" | "name") {
+  const text = filesOf(nodes)
+    .map((f) => (kind === "name" ? basename(f.path) : f.path))
+    .join("\n");
+  if (text) void writeClipboardText(text);
+}
+
+export function nodeMenu(
+  nodes: ChangeNode[],
+  repos: readonly string[],
+  opts?: { roots?: readonly ChangeNode[] },
+): MenuItem[] {
   const files = filesOf(nodes);
   const deletable = deletableFiles(nodes);
   const paths = files.map((f) => f.path);
@@ -268,7 +352,22 @@ export function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuIte
       run: () => commitFiles(paths),
     },
     { kind: "separator" },
-    { kind: "action", action: "vcs.showDiff", arg: first?.path },
+    // Under the modal interface the node itself, like double-click, in the front window.
+    vcsDiffInFront() && opts?.roots && first
+      ? {
+          label: "Show Diff",
+          icon: "diff",
+          shortcut: shortcutLabel("vcs.showDiff"),
+          // An explicit Show Diff always opens the diff, whatever Show on Double-Click says.
+          run: () => openNode(first, opts.roots!, true),
+        }
+      : { kind: "action", action: "vcs.showDiff", arg: first?.path },
+    {
+      kind: "action",
+      action: "vcs.showDiffInNewWindow",
+      arg: first?.path ? (opts?.roots ? changeNodeDiffData(opts.roots, first) : changeNodeDiff(first)) : undefined,
+      disabled: !first?.path,
+    },
     {
       label: "Jump to Source",
       icon: "external-link",
@@ -294,27 +393,30 @@ export function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuIte
           },
         ]
       : []),
+    // Both destinations, as in the project view's Git menu.
     ...(toIgnore.length
       ? [
           {
-            kind: "action" as const,
-            action: "vcs.ignoreShared",
-            arg: toIgnore,
             label: "Add to .gitignore",
+            submenu: [
+              { kind: "action" as const, action: "vcs.ignoreShared", arg: toIgnore, label: ".gitignore" },
+              { kind: "action" as const, action: "vcs.ignoreLocal", arg: toIgnore, label: ".git/info/exclude" },
+            ],
           },
         ]
       : []),
     {
       label: "Stage",
       icon: "plus",
-      disabled: !files.some((f) => f.unstaged),
-      run: () => void call(commands.vcsStage(paths)).finally(() => void refreshNow()),
+      // Under Staged Changes, a partially staged file only offers Unstage.
+      disabled: !files.some((f) => f.unstaged) || nodes.every((n) => n.group === "staged"),
+      run: () => void runOp(tx`Stage ${paths.length} files`, () => call(commands.vcsStage(paths))),
     },
     {
       label: "Unstage",
       icon: "minus",
-      disabled: !files.some((f) => f.staged),
-      run: () => void call(commands.vcsUnstage(paths)).finally(() => void refreshNow()),
+      disabled: !files.some((f) => f.staged) || nodes.every((n) => n.group === "unstaged" || n.group === "unversioned"),
+      run: () => void runOp(tx`Unstage ${paths.length} files`, () => call(commands.vcsUnstage(paths))),
     },
     { kind: "separator" },
     ...(nodes.some((n) => n.changelist)
@@ -322,6 +424,7 @@ export function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuIte
       : []),
     { kind: "action", action: "vcs.shelve", arg: paths },
     { kind: "action", action: "vcs.createPatch", arg: paths },
+    { kind: "action", action: "vcs.stashSelected", arg: paths, disabled: !paths.length },
     { label: "Copy as Patch to Clipboard", run: () => void copyChangesAsPatch(paths) },
     { kind: "separator" },
     {
@@ -333,9 +436,49 @@ export function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuIte
     { kind: "action", action: "vcs.localHistory", arg: first?.path },
     { kind: "action", action: "vcs.annotate", arg: first?.path },
     { kind: "separator" },
-    { label: "Copy Path", icon: "copy", run: () => void navigator.clipboard?.writeText(paths.join("\n")) },
+    // Other features' groups (Deployment) for the files that exist.
+    ...menuGroupItems("changes", {
+      paths: files.filter(onDisk).map((f) => stripSlash(f.path)),
+    }),
+    { label: "Copy Path", icon: "copy", run: () => copyChangePaths(nodes, "absolute") },
+    { label: "Copy File Name", icon: "copy", run: () => copyChangePaths(nodes, "name") },
   );
   return items;
+}
+
+/**
+ * The staging operation of a node of the staging area's tree: Unstage under Staged, Stage
+ * under Unstaged and Unversioned Files, applied to every file below the node.
+ */
+export function stageOperation(n: ChangeNode): { label: string; icon: "plus" | "minus"; paths: string[] } | null {
+  const paths = n.files.map((f) => stripSlash(f.path));
+  if (!paths.length) return null;
+  if (n.group === "staged") return { label: "Unstage", icon: "minus", paths };
+  if (n.group === "unstaged" || n.group === "unversioned") return { label: "Stage", icon: "plus", paths };
+  return null;
+}
+
+function StageButton({ node }: { node: ChangeNode }) {
+  const op = stageOperation(node);
+  if (!op) return null;
+  const { label, icon, paths } = op;
+  const count = paths.length;
+  return (
+    <IconButton
+      icon={icon}
+      title={label}
+      size="small"
+      className={styles.stageButton}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        void runOp(icon === "plus" ? tx`Stage ${count} files` : tx`Unstage ${count} files`, () =>
+          call(icon === "plus" ? commands.vcsStage(paths) : commands.vcsUnstage(paths)),
+        ).then(() => refreshNow());
+      }}
+    />
+  );
 }
 
 function CheckMark({
@@ -374,7 +517,11 @@ function useCommitChecks() {
   const root = useVcs((s) => s.root) ?? "";
   const userChecks = useCommit((s) => s.checks);
   const lists = useChangelists((s) => s.state);
-  return useMemo(() => withListDefaults(status, root, lists, userChecks), [status, root, lists, userChecks]);
+  const staging = useStagingArea();
+  return useMemo(
+    () => inclusionChecks(status, root, lists, userChecks, staging),
+    [status, root, lists, userChecks, staging],
+  );
 }
 
 /** Number of changes the commit would include. */
@@ -395,14 +542,18 @@ function ChangesPanel() {
   const path = useCommit((s) => (s.selection.length === 1 ? s.selection[0] : null));
   const hasChanges = useVcs((s) => s.status.length > 0);
   return (
-    <SplitGroup orientation="horizontal" className={styles.split}>
-      <SplitPanel defaultSize="62%" minSize="20%">
-        <SplitGroup orientation="vertical" className={styles.split}>
-          <SplitPanel defaultSize="62%" minSize="20%">
+    <SplitGroup
+      orientation="horizontal"
+      className={styles.split}
+      storageKey={preview ? "openidea.vcs.commitPreviewSplit" : undefined}
+    >
+      <SplitPanel id="commit" defaultSize="62%" minSize="20%">
+        <SplitGroup orientation="vertical" className={styles.split} storageKey="openidea.vcs.commitMessageSplit">
+          <SplitPanel id="changes" defaultSize="62%" minSize="20%">
             <ChangesTree mode="commit" />
           </SplitPanel>
           <SplitHandle />
-          <SplitPanel defaultSize="38%" minSize="120px">
+          <SplitPanel id="message" defaultSize="38%" minSize="120px">
             <CommitPanel included={included} />
           </SplitPanel>
         </SplitGroup>
@@ -410,7 +561,7 @@ function ChangesPanel() {
       {preview && (
         <>
           <SplitHandle />
-          <SplitPanel defaultSize="38%" minSize="120px">
+          <SplitPanel id="preview" defaultSize="38%" minSize="120px">
             {path ? (
               <DiffEditor input={diffInput(workingDiffData(path))} />
             ) : (
@@ -434,14 +585,20 @@ export function LocalChangesView() {
   const path = useCommit((s) => (s.selection.length === 1 ? s.selection[0] : null));
   const anchor = useToolWindowLayout((s) => s.placements.git?.anchor ?? "bottom");
   return (
-    <SplitGroup orientation={anchor === "bottom" ? "horizontal" : "vertical"} className={styles.split}>
-      <SplitPanel defaultSize="50%" minSize="20%">
+    <SplitGroup
+      orientation={anchor === "bottom" ? "horizontal" : "vertical"}
+      className={styles.split}
+      storageKey={
+        preview ? `openidea.vcs.localChangesSplit.${anchor === "bottom" ? "horizontal" : "vertical"}` : undefined
+      }
+    >
+      <SplitPanel id="changes" defaultSize="50%" minSize="20%">
         <ChangesTree mode="local" />
       </SplitPanel>
       {preview && (
         <>
           <SplitHandle />
-          <SplitPanel defaultSize="50%" minSize="120px">
+          <SplitPanel id="preview" defaultSize="50%" minSize="120px">
             {path ? (
               <DiffEditor input={diffInput(workingDiffData(path))} />
             ) : (
@@ -465,12 +622,18 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
   const status = useVcs((s) => s.status);
   const root = useVcs((s) => s.root) ?? "";
   const groupByDir = useCommit((s) => s.groupByDir);
-  const groupByStaging = useCommit((s) => s.groupByStaging);
+  // With the staging area the Commit tool window shows the index: Staged / Unstaged, no lists or checkboxes.
+  const staging = useStagingArea() && mode === "commit";
+  const groupByStaging = useCommit((s) => s.groupByStaging) || staging;
+  const groupByRepo = useCommit((s) => s.groupByRepo);
+  const showUnversionedSeparately = useCommit((s) => s.showUnversionedSeparately);
   const diffPreview = useCommit((s) => s.diffPreview);
   const commitDiffPreview = useCommit((s) => s.commitDiffPreview);
-  const lists = useChangelists((s) => s.state);
+  const doubleClickOpensDiff = useWorkflowSettings((s) => s.vcs.commit.doubleClickOpensDiff);
+  const changelists = useChangelists((s) => s.state);
+  const lists = staging ? undefined : changelists;
   const checks = useCommitChecks();
-  const checkboxes = mode !== "local";
+  const checkboxes = mode !== "local" && !staging;
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   // IDEA starts with Unversioned Files collapsed.
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(["group:unversioned"]));
@@ -479,10 +642,22 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
   const viewRef = useRef<HTMLButtonElement>(null);
 
   const repos = useVcs((s) => s.roots);
+  const heads = useVcs((s) => s.heads);
   const projectRoots = useEffectiveRoots();
   const roots = useMemo(
-    () => buildChangeTree(status, root, groupByDir, lists, repos, groupByStaging),
-    [status, root, groupByDir, lists, repos, groupByStaging],
+    () =>
+      buildChangeTree(
+        status,
+        root,
+        groupByDir,
+        lists,
+        repos,
+        groupByStaging,
+        heads,
+        groupByRepo,
+        showUnversionedSeparately,
+      ),
+    [status, root, groupByDir, lists, repos, groupByStaging, heads, groupByRepo, showUnversionedSeparately],
   );
   const [byKey, parents] = useMemo(() => {
     const m = new Map<string, ChangeNode>();
@@ -497,15 +672,61 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
     return [m, up] as const;
   }, [roots]);
 
-  /** Select Opened File: reveals the focused editor's file in the tree. */
+  const [nodeToReveal, setNodeToReveal] = useState<{ key: string } | null>(null);
+  const revealNode = useCallback(
+    (node: ChangeNode) => {
+      const ancestors = new Set<string>();
+      for (let key = parents.get(node.key); key; key = parents.get(key)) ancestors.add(key);
+      setCollapsed((current) => new Set([...current].filter((key) => !ancestors.has(key))));
+      setNodeToReveal({ key: node.key });
+    },
+    [parents],
+  );
+
+  const followedDiff = useRef<string | null>(null);
+  useEffect(() => {
+    const editor = maybeEditorService();
+    const followDiff = (input: EditorInput | null) => {
+      if (input?.kind !== DIFF_KIND) {
+        followedDiff.current = null;
+        return;
+      }
+      if (input.key === followedDiff.current) return;
+      const node = [...byKey.values()].find((node) => {
+        if (node.type !== "file" || node.path !== input.path) return false;
+        return diffInput(changeNodeDiff(node)).key === input.key;
+      });
+      if (node) {
+        followedDiff.current = input.key;
+        revealNode(node);
+      } else {
+        followedDiff.current = null;
+      }
+    };
+    followDiff(editor?.activeInput?.() ?? null);
+    return editor?.onActiveInputChange?.(followDiff);
+  }, [byKey, revealNode]);
+
+  // While the active tab shows one of this tree's diffs, a single selected file replaces it,
+  // keeping focus in the tree (a click or arrow key walks the changes).
+  const followSelection = (nodes: readonly ChangeNode[]) => {
+    const node = nodes.length === 1 ? nodes[0] : undefined;
+    if (mode === "dialog" || node?.type !== "file" || !node.path) return;
+    const active = maybeEditorService()?.activeInput?.();
+    if (active?.kind !== DIFF_KIND || active.key !== followedDiff.current) return;
+    if (diffInput(changeNodeDiff(node)).key === active.key) return;
+    void openDiff(changeTreeDiffData(roots, node), { preview: true, focus: false });
+  };
+
+  // Reveal only after the ancestors have expanded, without moving keyboard focus.
+  useLayoutEffect(() => {
+    if (nodeToReveal) treeRef.current?.reveal(nodeToReveal.key);
+  }, [nodeToReveal]);
+
   const selectOpened = () => {
     const path = editorService().activePath();
-    const node = path ? [...byKey.values()].find((n) => n.type === "file" && n.path === path) : undefined;
-    if (!node) return;
-    const ancestors: string[] = [];
-    for (let k = parents.get(node.key); k; k = parents.get(k)) ancestors.push(k);
-    setCollapsed((c) => new Set([...c].filter((k) => !ancestors.includes(k))));
-    requestAnimationFrame(() => treeRef.current?.reveal(node.key));
+    const node = path ? [...byKey.values()].find((node) => node.type === "file" && node.path === path) : undefined;
+    if (node) revealNode(node);
   };
   const expanded = useMemo(() => {
     const s = new Set<string>();
@@ -554,13 +775,27 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
             showContextMenu(bottomLeft(viewRef.current), [
               { kind: "header", label: "Group By" },
               { label: "Directory", checked: groupByDir, run: () => setGroupByDir(!groupByDir) },
-              { label: "Staging State", checked: groupByStaging, run: () => setGroupByStaging(!groupByStaging) },
+              // IDEA offers it once the project has several repositories.
+              ...(repos.length > 1
+                ? [{ label: "Repository", checked: groupByRepo, run: () => setGroupByRepo(!groupByRepo) }]
+                : []),
+              ...(staging
+                ? []
+                : [{ label: "Staging State", checked: groupByStaging, run: () => setGroupByStaging(!groupByStaging) }]),
+              { kind: "separator" },
+              {
+                label: "Show Unversioned Files Separately",
+                checked: showUnversionedSeparately,
+                run: () => setShowUnversionedSeparately(!showUnversionedSeparately),
+              },
               ...(mode === "local"
                 ? [
                     { kind: "separator" } as const,
                     { label: "Show Diff Preview", checked: diffPreview, run: () => setDiffPreview(!diffPreview) },
                   ]
                 : []),
+              // Not in the Commit dialog, whose files always open as source.
+              ...(mode === "dialog" ? [] : doubleClickMenu(doubleClickOpensDiff)),
             ])
           }
         />
@@ -589,6 +824,7 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
       {mode !== "dialog" && <OperationBanner />}
       <div
         className={styles.treeWrap}
+        data-changes-tree={mode}
         onKeyDownCapture={(e) => {
           if (checkboxes && e.key === " " && !e.metaKey && !e.ctrlKey && selected.size) {
             e.preventDefault();
@@ -607,11 +843,14 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
               e.stopPropagation();
               void deleteFiles(deletable);
             }
-          } else if (e.key === "F4") {
-            const n = selectedNodes().find((x) => x.type === "file");
-            if (n?.path) {
+          } else {
+            // IDEA: Ctrl+C copies the file names, Ctrl+Shift+C the absolute paths (#1877).
+            const stroke = strokeOf(e.nativeEvent);
+            const copy = stroke && normalizeBinding(macStroke(stroke));
+            if (copy === "Meta+C" || copy === "Shift+Meta+C") {
               e.preventDefault();
-              void editorService().openFile(n.path, { focus: true });
+              e.stopPropagation();
+              copyChangePaths(selectedNodes(), copy === "Meta+C" ? "name" : "absolute");
             }
           }
         }}
@@ -642,10 +881,16 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
             const nodes = [...sel].map((k) => byKey.get(k)).filter((n): n is ChangeNode => !!n);
             useCommit.setState({
               selection: filesOf(nodes).map((f) => f.path),
+              selectionKeys: [...sel],
               selectedList: nodes.find((n) => n.changelist)?.changelist ?? null,
             });
+            followSelection(nodes);
           }}
-          onActivate={(n) => openNode(n, roots)}
+          onActivate={(n) => openNode(n, roots, mode === "dialog")}
+          onJumpToSource={(n) => {
+            const file = n.type === "file" ? n : selectedNodes().find((x) => x.type === "file");
+            if (file?.path && file.kind !== "deleted") void editorService().openFile(file.path, { focus: true });
+          }}
           onContextMenu={(node, sel, e: MouseEvent) => {
             if (!node) return;
             if (node.type === "group" && node.changelist) {
@@ -653,7 +898,7 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
               return;
             }
             const nodes = [...sel].map((k) => byKey.get(k)).filter((n): n is ChangeNode => !!n);
-            showContextMenu(e, nodeMenu(nodes.length ? nodes : [node], repos));
+            showContextMenu(e, nodeMenu(nodes.length ? nodes : [node], repos, { roots }));
           }}
           aria-label="Changes"
           empty={
@@ -671,43 +916,44 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
                   n.type === "group" && n.changelist && !n.active && styles.inactiveList,
                 )}
                 style={n.type === "file" && n.kind ? { color: KIND_COLOR[n.kind] } : undefined}
-                title={n.type === "file" && n.kind ? tx(KIND_LABEL[n.kind]) : undefined}
+                {...(n.type === "file" && n.kind && tooltipAttrs(KIND_LABEL[n.kind]))}
               >
                 {nodeText(n)}
               </span>
             );
             // Pointer-driven (HTML5 drag and drop never reaches the Tauri webview):
-            // files and folders drag; any row takes them into its changelist.
+            // file and folder rows drag (unversioned ones onto a changelist, which
+            // adds them to Git); any row of a changelist takes dropped files into it.
             const list = n.changelist;
-            const dnd =
-              list === undefined
-                ? {}
-                : {
-                    ref: (el: HTMLSpanElement | null) =>
-                      el
-                        ? registerDropTarget(el, {
-                            accepts: (type) => type === CHANGES_MIME,
-                            over: () => setDropTarget(list),
-                            leave: () => setDropTarget(null),
-                            drop: (data) => {
-                              setDropTarget(null);
-                              moveToChangelist(data.payload.split("\n"), list);
-                            },
-                          })
-                        : undefined,
-                    ...(n.type !== "group" && {
-                      onPointerDown: (e: PointerEvent<HTMLSpanElement>) => {
-                        const paths =
-                          selected.has(n.key) && selected.size > 1
-                            ? filesOf(selectedNodes()).map((f) => f.path)
-                            : n.files.map((f) => f.path);
-                        startPointerDrag(e, e.currentTarget, {
-                          type: CHANGES_MIME,
-                          payload: paths.map(stripSlash).join("\n"),
-                        });
-                      },
-                    }),
-                  };
+            const dnd = {
+              ...(list !== undefined && {
+                ref: (el: HTMLSpanElement | null) =>
+                  el
+                    ? registerDropTarget(el, {
+                        accepts: (type) => type === CHANGES_MIME,
+                        over: () => setDropTarget(list),
+                        leave: () => setDropTarget(null),
+                        drop: (data) => {
+                          setDropTarget(null);
+                          void addToChangelist(data.payload.split("\n"), list);
+                        },
+                      })
+                    : undefined,
+              }),
+              ...(n.type !== "group" &&
+                n.files.length > 0 && {
+                  onPointerDown: (e: PointerEvent<HTMLSpanElement>) => {
+                    const paths =
+                      selected.has(n.key) && selected.size > 1
+                        ? filesOf(selectedNodes()).map((f) => f.path)
+                        : n.files.map((f) => f.path);
+                    startPointerDrag(e, e.currentTarget, {
+                      type: CHANGES_MIME,
+                      payload: paths.map(stripSlash).join("\n"),
+                    });
+                  },
+                }),
+            };
             return (
               <span
                 className={clsx(styles.nodeRow, n.type === "group" && dropTarget === n.changelist && styles.dropTarget)}
@@ -730,12 +976,14 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
                 )}
                 {label}
                 {n.type === "group" && <span className={styles.detail}>{fileCount(n.files.length)}</span>}
-                {n.type === "file" && n.files[0] && isPartiallyStaged(n.files[0]) && (
+                {!staging && n.type === "file" && n.files[0] && isPartiallyStaged(n.files[0]) && (
                   <span className={styles.partial} title={tx("Partially staged: only staged hunks are committed")}>
                     <T>partial</T>
                   </span>
                 )}
+                {n.detail && n.detailIcon && <Icon name={n.detailIcon} size={14} className={styles.detailIcon} />}
                 {n.detail && <span className={styles.detail}>{n.detail}</span>}
+                {staging && <StageButton node={n} />}
               </span>
             );
           }}
@@ -743,6 +991,14 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
       </div>
     </div>
   );
+}
+
+const MISSING_BLANK_LINE = "Missing blank line between subject and body";
+
+/** The quick fix for {@link MISSING_BLANK_LINE}: an empty line after the subject. */
+export function addBlankLineAfterSubject(message: string): string {
+  const end = message.indexOf("\n");
+  return end < 0 ? message : `${message.slice(0, end)}\n${message.slice(end)}`;
 }
 
 /** Commit message inspections (Settings › Version Control › Commit). */
@@ -760,8 +1016,7 @@ export function messageProblems(
   const out: string[] = [];
   if (c.limitSubject && (lines[0]?.length ?? 0) > c.subjectLimit)
     out.push(`Subject line is longer than ${c.subjectLimit} characters`);
-  if (c.blankLineAfterSubject && lines.length > 1 && lines[1]!.trim() !== "")
-    out.push("Missing blank line between subject and body");
+  if (c.blankLineAfterSubject && lines.length > 1 && lines[1]!.trim() !== "") out.push(MISSING_BLANK_LINE);
   if (c.limitBody) {
     const long = lines.slice(1).findIndex((l) => l.length > c.bodyLimit);
     if (long >= 0) out.push(`Body line ${long + 2} is longer than ${c.bodyLimit} characters`);
@@ -830,12 +1085,21 @@ export function useCommitRunner(included: number, onCommitted?: () => void): Com
 }
 
 /** Amend, message history and the message field with its inspections and failed checks. */
-export function CommitMessageField({ included, runner }: { included: number; runner: CommitRunner }) {
+export function CommitMessageField({
+  included,
+  runner,
+  autoFocus = false,
+}: {
+  included: number;
+  runner: CommitRunner;
+  /** The message takes the initial focus of the dialog it is in (the Commit dialog). */
+  autoFocus?: boolean;
+}) {
   const message = useCommit((s) => s.message);
   const amend = useCommit((s) => s.amend);
   const focusTick = useCommit((s) => s.focusTick);
   const ref = useRef<HTMLTextAreaElement>(null);
-  const historyRef = useRef<HTMLButtonElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyTick = useCommit((s) => s.historyTick);
   const checkProblems = useCommit((s) => s.checkProblems);
@@ -866,10 +1130,9 @@ export function CommitMessageField({ included, runner }: { included: number; run
 
   return (
     <>
-      <div className={styles.commitBar}>
+      <div ref={barRef} className={styles.commitBar}>
         <Checkbox checked={amend} onChange={(v) => void setAmend(v)} label="Amend" />
         <IconButton
-          ref={historyRef}
           icon="history"
           title="Commit Message History"
           size="small"
@@ -881,8 +1144,9 @@ export function CommitMessageField({ included, runner }: { included: number; run
         <Menu
           open={historyOpen}
           onClose={() => setHistoryOpen(false)}
-          anchor={historyRef}
-          placement="bottom-end"
+          anchor={barRef}
+          placement="top-start"
+          iconColumn={false}
           aria-label="Recent commit messages"
           items={history.map((m, i) => ({
             id: `h${i}`,
@@ -893,6 +1157,7 @@ export function CommitMessageField({ included, runner }: { included: number; run
             },
           }))}
         />
+        <CommitMessageActions />
         <span className={styles.grow} />
         {tooLong && (
           <span className={clsx(styles.lineLen, styles.lineLenWarn)} title={tx("Subject line length")}>
@@ -902,6 +1167,7 @@ export function CommitMessageField({ included, runner }: { included: number; run
       </div>
       <textarea
         ref={ref}
+        data-autofocus={autoFocus ? "" : undefined}
         className={clsx(styles.message, !showMargin && styles.noMargin, emptyError && styles.messageError)}
         aria-invalid={emptyError || undefined}
         style={{ ["--guide" as string]: `${margin}ch` }}
@@ -933,7 +1199,29 @@ export function CommitMessageField({ included, runner }: { included: number; run
       )}
       {problems.length > 0 && (
         <div className={styles.inspections} role="status">
-          {problems.join(" · ")}
+          {problems.map((p, i) => (
+            <span key={p}>
+              {i > 0 && " · "}
+              {txTemplate(p)}
+              {p === MISSING_BLANK_LINE && (
+                <button
+                  type="button"
+                  className={styles.inspectionFix}
+                  onClick={() => {
+                    const el = ref.current;
+                    const caret = el ? el.selectionStart + (el.selectionStart > first.length ? 1 : 0) : 0;
+                    useCommit.setState({ message: addBlankLineAfterSubject(message) });
+                    requestAnimationFrame(() => {
+                      el?.focus();
+                      el?.setSelectionRange(caret, caret);
+                    });
+                  }}
+                >
+                  <T>Add blank line</T>
+                </button>
+              )}
+            </span>
+          ))}
         </div>
       )}
       {checkProblems.length > 0 && (
@@ -961,9 +1249,24 @@ export function CommitMessageField({ included, runner }: { included: number; run
   );
 }
 
+/** Actions contributed above the message (a plugin's `commit.message` menu items). */
+function CommitMessageActions() {
+  const items = useMenuSlotItems((s) => s.slots.commitMessage);
+  useContextKeys();
+  return (
+    <>
+      {(items ?? [])
+        .filter((i) => evaluateWhen(i.when ?? undefined))
+        .map((i) => (
+          <IconButton key={i.action} icon={i.icon ?? "plugin"} action={i.action} actionArg={i.arg} size="small" />
+        ))}
+    </>
+  );
+}
+
 /** Label of the Commit button. */
-export function commitLabel(amend: boolean, problems: boolean): string {
-  return problems ? "Commit Anyway" : amend ? "Amend Commit" : "Commit";
+export function commitLabel(amend: boolean, problems: boolean, all = false): string {
+  return problems ? "Commit Anyway" : amend ? "Amend Commit" : all ? "Commit All" : "Commit";
 }
 
 /** Label of the Commit and Push button. */
@@ -980,13 +1283,15 @@ function CommitPanel({ included }: { included: number }) {
   const { canCommit } = runner;
   // After Fixup… / Squash Into…, the second button commits and autosquashes the target.
   const fixup = useCommit((s) => pendingFixup(s.message, s.fixupTarget));
+  const staging = useStagingArea();
+  const commitAll = useVcs((s) => staging && isCommitAll(s.status));
 
   return (
     <div className={styles.commit}>
       <CommitMessageField included={included} runner={runner} />
       <div className={styles.commitActions}>
         <Button variant="primary" disabled={!canCommit} onClick={() => void runner.run(false)} title="⌘↩">
-          <T>{commitLabel(amend, checkProblems.length > 0)}</T>
+          <T>{commitLabel(amend, checkProblems.length > 0, commitAll)}</T>
         </Button>
         {fixup ? (
           <Button
@@ -1004,7 +1309,7 @@ function CommitPanel({ included }: { included: number }) {
             className={styles.pushButton}
             disabled={!canCommit || !!remoteBusy}
             onClick={() => void runner.run(true)}
-            title="⌥⌘↩"
+            title={`${tx(commitAndPushLabel(amend))} (⌥⌘↩)`}
           >
             <span>
               <T>{commitAndPushLabel(amend)}</T>
@@ -1130,8 +1435,8 @@ export function StashesPanel() {
                 {repos.length > 1 && s.repo ? `${repoName(s.repo)} · ` : ""}
                 {text}
               </span>
-              {branch && <span className={styles.detail}>{branch}</span>}
-              <span className={styles.detail}>{formatTime(s.timeMs)}</span>
+              {branch && <span className={clsx(styles.detail, styles.stashBranch)}>{branch}</span>}
+              <span className={clsx(styles.detail, styles.stashTime)}>{formatTime(s.timeMs)}</span>
             </span>
           );
         }}

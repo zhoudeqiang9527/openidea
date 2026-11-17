@@ -1,19 +1,20 @@
 /** Local change operations: commit, rollback, add, stash. */
 import { useEffect, useState } from "react";
-import type { FileStatus, PartialCommitFile, Stash } from "@/bindings";
+import type { FileStatus, Stash } from "@/bindings";
 import { call, commands } from "@/platform/ipc";
-import { Checkbox, Dialog, Icon, Input, T, fileIconName } from "@/ui";
+import { Checkbox, Dialog, Icon, IconButton, Input, T, fileIconName } from "@/ui";
 import { notifications } from "@/workbench/contributions";
-import { commitRepos, groupOf, planCommit, remainingOverrides, renamedFromPath } from "./changes";
-import { useChangelists, withListDefaults } from "./changelists";
+import { addedThenDeleted, groupOf, remainingOverrides, renamedFromPath } from "./changes";
 import { runCommitChecks } from "./commitChecks";
+import { contributedCheckProblems, currentPlan, selectionOf } from "./commitSelection";
 import { forgetAmendDraft, keepMessageAfterCommit, rememberMessage, useCommit } from "./commitStore";
 import { workflowSettings } from "@/platform/workflowSettings";
 import { notifyFileOperation } from "@/platform/fileOps";
 import { confirmDialog, openDialog } from "./dialogs";
-import { hunkKeys } from "./hunks";
-import { KIND_COLOR, baseName, dirName, effectiveKind, relTo, rootOf, stripSlash } from "./model";
+import { RepoPicker, useBranchInfo } from "./gitMenuDialogs";
+import { KIND_COLOR, baseName, dirName, effectiveKind, relTo, stripSlash } from "./model";
 import { logConsole, runOp, saveAll } from "./ops";
+import { showCompareRevisions } from "./operations";
 import { currentRepo, loadStashes, refreshNow, useVcs } from "./store";
 import styles from "./common.module.css";
 import { tx } from "@/platform/i18n";
@@ -29,21 +30,14 @@ export function firstLine(message: string): string {
 
 /** Stages the included changes and commits them. Returns the new commit id. */
 export async function commitChanges(): Promise<string | undefined> {
-  const { message, amend, signOff, author, runHooks } = useCommit.getState();
+  const { message, amend } = useCommit.getState();
   if (!message.trim() && !amend) {
     notifications().notify({ group: "vcs", level: "warning", title: "Commit message is empty" });
     return undefined;
   }
   await saveAll();
   await refreshNow();
-  const status = useVcs.getState().status;
-  const checks = withListDefaults(
-    status,
-    useVcs.getState().root ?? "",
-    useChangelists.getState().state,
-    useCommit.getState().checks,
-  );
-  const plan = planCommit(status, checks);
+  const plan = currentPlan();
   // Concluding a merge needs no further changes (e.g. every conflict resolved as "yours").
   const merging = useVcs.getState().branch?.operation === "merge";
   if (!plan.included.length && !amend && !merging) {
@@ -60,38 +54,32 @@ export async function commitChanges(): Promise<string | undefined> {
     });
     return undefined;
   }
-  const candidates = plan.included.map((f) => ({ path: stripSlash(f.path), exists: effectiveKind(f) !== "deleted" }));
+  const candidates = plan.included.map((f) => ({
+    path: stripSlash(f.path),
+    exists: effectiveKind(f) !== "deleted" && !addedThenDeleted(f),
+  }));
   // IDEA: failed checks show in the commit panel; the next Commit ("Commit Anyway") skips them.
-  if (!useCommit.getState().checkProblems.length) {
-    const problems = await runCommitChecks(candidates, amend);
+  const checked = !useCommit.getState().checkProblems.length;
+  if (checked) {
+    const { problems, blocked } = await runCommitChecks(candidates, amend);
+    if (problems.length) useCommit.setState({ checkProblems: problems });
+    if (blocked) return undefined;
+  }
+  // After the checks: their modifications (reformat…) are part of the commit.
+  const selection = await selectionOf(plan);
+  if (checked) {
+    const problems = await contributedCheckProblems(selection);
     if (problems.length) {
       useCommit.setState({ checkProblems: problems });
       return undefined;
     }
   }
-  const partial = await partialCommitFiles(plan.partial);
-  // Like IDEA, every repository with included changes gets a commit with the same message.
-  const roots = useVcs.getState().roots;
-  const repos = commitRepos(plan.included, roots, currentRepo());
   const id = await runOp(
     amend ? "Amend commit" : "Commit",
     async () => {
-      // The commit is made from a copy of the index, so changes left out keep their
-      // staged state and the other repositories' indexes stay as they are.
-      const stage = [...plan.stage, ...partial.whole];
       let id = "";
-      for (const repo of repos) {
-        const inRepo = (path: string) => repos.length === 1 || (rootOf(path, roots) ?? null) === repo;
-        const options = {
-          amend,
-          signOff,
-          author: author.trim() || null,
-          runHooks,
-          partial: partial.files.filter((f) => inRepo(f.path)),
-          stage: stage.filter(inRepo),
-          exclude: plan.exclude.filter(inRepo),
-        };
-        id = await call(commands.vcsCommit(repo, message.trim(), options));
+      for (const repo of selection.repositories) {
+        id = await call(commands.vcsCommit(repo.root || null, message.trim(), repo.options));
       }
       return id;
     },
@@ -99,7 +87,7 @@ export async function commitChanges(): Promise<string | undefined> {
       success: () => {
         const n = plan.included.length;
         const summary = firstLine(message);
-        const several = repos.length;
+        const several = selection.repositories.length;
         const done = amend
           ? several > 1
             ? n === 1
@@ -133,31 +121,6 @@ export async function commitChanges(): Promise<string | undefined> {
     keepMessageAfterCommit(message, workflowSettings().vcs.commit.clearInitialMessage);
   }
   return id;
-}
-
-/**
- * The included blocks of files committed partially, as hunk ranges against HEAD of the
- * text on disk (saved just before). A file whose blocks are all included again (e.g. it
- * was edited since) is committed whole.
- */
-async function partialCommitFiles(paths: readonly string[]): Promise<{ files: PartialCommitFile[]; whole: string[] }> {
-  const files: PartialCommitFile[] = [];
-  const whole: string[] = [];
-  const excludedHunks = useCommit.getState().excludedHunks;
-  for (const path of paths) {
-    const [head, disk] = await Promise.all([call(commands.vcsFileAt(path, "HEAD")), call(commands.fsReadText(path))]);
-    const hunks = await commands.vcsDiffHunks(head ?? "", disk);
-    const keys = hunkKeys(disk, hunks);
-    const excluded = excludedHunks.get(path) ?? excludedHunks.get(`${path}/`);
-    const chosen = hunks.filter((_, i) => !excluded?.has(keys[i]!));
-    if (chosen.length === hunks.length) whole.push(path);
-    else
-      files.push({
-        path,
-        hunks: chosen.map(({ start, lines, oldStart, oldLines }) => ({ start, lines, oldStart, oldLines })),
-      });
-  }
-  return { files, whole };
 }
 
 /** Delete… on unversioned files in the Changes view, as in IDEA: they move to the Trash. */
@@ -346,18 +309,32 @@ export async function addToVcs(paths: readonly string[]) {
   );
 }
 
-/** Stash Changes dialog: message, Keep index (staged changes stay), include untracked files. */
-export function stashChanges(repo = currentRepo()): Promise<void> {
+/**
+ * Stash Changes dialog: message, Keep index (staged changes stay), include untracked files.
+ * `repo`: the repository it starts on; selected `paths` stash in the repositories holding them.
+ */
+export function stashChanges(paths: readonly string[] = [], repo = currentRepo()): Promise<void> {
   return new Promise((resolve) => {
     const close = openDialog(() => (
       <StashDialog
+        initialRepo={repo}
+        pickRepo={!paths.length}
         onDone={async (r) => {
           close();
           if (r) {
             await saveAll();
             await runOp(
               tx("Stash changes"),
-              () => call(commands.vcsStashPush(repo, r.message || null, r.includeUntracked, r.keepIndex)),
+              () =>
+                call(
+                  commands.vcsStashPush(
+                    r.repo,
+                    r.message || null,
+                    r.includeUntracked,
+                    r.keepIndex,
+                    paths.length ? [...paths] : null,
+                  ),
+                ),
               { success: tx("Changes stashed") },
             );
             void loadStashes().catch(() => undefined);
@@ -370,15 +347,20 @@ export function stashChanges(repo = currentRepo()): Promise<void> {
 }
 
 function StashDialog({
+  initialRepo,
+  pickRepo,
   onDone,
 }: {
-  onDone: (r: { message: string; keepIndex: boolean; includeUntracked: boolean } | null) => void;
+  initialRepo: string | null;
+  pickRepo: boolean;
+  onDone: (r: { repo: string | null; message: string; keepIndex: boolean; includeUntracked: boolean } | null) => void;
 }) {
+  const [repo, setRepo] = useState(initialRepo);
   const [message, setMessage] = useState("");
   const [keepIndex, setKeepIndex] = useState(false);
   const [includeUntracked, setIncludeUntracked] = useState(false);
-  const branch = useVcs((s) => s.branch?.head ?? null);
-  const submit = () => onDone({ message: message.trim(), keepIndex, includeUntracked });
+  const branch = useBranchInfo(repo)?.head ?? null;
+  const submit = () => onDone({ repo, message: message.trim(), keepIndex, includeUntracked });
   return (
     <Dialog
       open
@@ -397,6 +379,7 @@ function StashDialog({
           submit();
         }}
       >
+        {pickRepo && <RepoPicker repo={repo} onChange={setRepo} />}
         {branch && <div className={styles.hint}>{tx`Current branch: ${branch}`}</div>}
         <label className={styles.fieldLabel}>
           <T>Message:</T>
@@ -448,13 +431,14 @@ export function applyStash(index: number, pop: boolean, repo = currentRepo()) {
   return unstash({ index, pop, reinstateIndex: false, branch: null }, repo);
 }
 
-/** Unstash Changes dialog: pick a stash; Pop, Reinstate index, or As new branch. */
+/** Unstash Changes dialog: pick a stash; Pop, Reinstate index, or As new branch; view or drop it. */
 export function showUnstashDialog(index = 0, repo = currentRepo()) {
   openDialog((close) => <UnstashDialog initial={index} repo={repo} onClose={close} />);
 }
 
 function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: string | null; onClose: () => void }) {
   const [stashes, setStashes] = useState<Stash[]>([]);
+  const [tick, setTick] = useState(0);
   useEffect(() => {
     let live = true;
     void call(commands.vcsStashes(repo))
@@ -463,13 +447,24 @@ function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: stri
     return () => {
       live = false;
     };
-  }, [repo]);
+  }, [repo, tick]);
   const [index, setIndex] = useState(initial);
   const [pop, setPop] = useState(false);
   const [reinstateIndex, setReinstateIndex] = useState(false);
   const [branch, setBranch] = useState("");
   const asBranch = branch.trim();
   const chosen = stashes.find((s) => s.index === index) ?? stashes[0];
+  const view = () => {
+    if (!chosen) return;
+    const ref = `stash@{${chosen.index}}`;
+    showCompareRevisions(`${ref}^`, ref, `${ref}^`, ref, repo);
+  };
+  const drop = async () => {
+    if (!chosen || !(await dropStash(chosen.index, chosen.message, repo))) return;
+    // The older stashes move up: the next one takes the dropped one's index, else the new last one.
+    setIndex(Math.max(0, Math.min(chosen.index, stashes.length - 2)));
+    setTick((n) => n + 1);
+  };
   const submit = () => {
     if (!chosen) return;
     onClose();
@@ -498,6 +493,10 @@ function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: stri
           submit();
         }}
       >
+        <div className={styles.manageBar} role="toolbar" aria-label={tx("Stashes")}>
+          <IconButton icon="diff" title="Show Changes" size="small" disabled={!chosen} onClick={view} />
+          <IconButton icon="trash" title="Drop Stash" size="small" disabled={!chosen} onClick={() => void drop()} />
+        </div>
         <div className={styles.choiceList} role="radiogroup" aria-label={tx("Stashes")}>
           {stashes.length === 0 && (
             <div className={styles.hint}>
@@ -529,7 +528,8 @@ function UnstashDialog({ initial, repo, onClose }: { initial: number; repo: stri
   );
 }
 
-export async function dropStash(index: number, message: string, repo = currentRepo()) {
+/** Drops the stash once confirmed; whether it was confirmed. */
+export async function dropStash(index: number, message: string, repo = currentRepo()): Promise<boolean> {
   const ok = await confirmDialog({
     title: "Drop Stash",
     message: message
@@ -538,9 +538,10 @@ export async function dropStash(index: number, message: string, repo = currentRe
     okLabel: "Drop",
     danger: true,
   });
-  if (!ok) return;
+  if (!ok) return false;
   await runOp(tx`Drop ${`stash@{${index}}`}`, () => call(commands.vcsStashDrop(repo, index)), {
     success: tx`Dropped ${`stash@{${index}}`}`,
   });
   void loadStashes().catch((e) => logConsole("err", String(e)));
+  return true;
 }

@@ -8,6 +8,7 @@ import { useEffect, useId, useState } from "react";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { WORKFLOW_LIMITS, type IssueLinkValid } from "@/platform/workflowSettings";
+import { showInFileManagerLabel } from "@/platform/fileManager";
 import { Button, Icon, Input, type SelectOption, T } from "@/ui";
 import { Row, SettingSelect } from "../components/Form";
 import { useSetting } from "../components/context";
@@ -203,6 +204,22 @@ function LargeFilesRow() {
   );
 }
 
+function InlineBlameRows() {
+  const [show] = useSetting<boolean>("vcs.git.inlineBlame");
+  return (
+    <>
+      <BoundToggle k="vcs.git.inlineBlame" label="Show inline blame for the current line" />
+      <Indented>
+        <BoundToggle
+          k="vcs.git.inlineBlameClickable"
+          label="Open the commit when the inline blame is clicked"
+          disabled={!show}
+        />
+      </Indented>
+    </>
+  );
+}
+
 function PushDialogRows() {
   const [show] = useSetting<boolean>("vcs.git.showPushDialog");
   return (
@@ -222,7 +239,7 @@ function PushDialogRows() {
 const PATCH_CREATED: SelectOption[] = [
   { value: "ask", label: "Ask" },
   { value: "no", label: "No" },
-  { value: "reveal", label: "Show in Finder" },
+  { value: "reveal", label: showInFileManagerLabel() },
 ];
 
 const INCOMING: SelectOption[] = [
@@ -492,12 +509,28 @@ export const VCS_PAGES: PageSpec[] = [
             keywords: ["Test", "git version"],
             component: GitExecutableRow,
           },
-          { kind: "toggle", key: "vcs.git.inlineBlame", label: "Show inline blame for the current line" },
+          {
+            kind: "custom",
+            label: "Show inline blame for the current line",
+            keywords: ["Open the commit when the inline blame is clicked"],
+            component: InlineBlameRows,
+          },
+          {
+            kind: "toggle",
+            key: "vcs.git.showBranchInProjectView",
+            label: "Show branch and incoming/outgoing commits in the Project view",
+          },
         ],
       },
       {
         title: "Commit",
         options: [
+          {
+            kind: "toggle",
+            key: "vcs.git.stagingArea",
+            label: "Enable staging area",
+            hint: "Commit works on the Git index: stage and unstage changes instead of checking them. Change lists are not used. Only for the non-modal commit interface.",
+          },
           { kind: "toggle", key: "vcs.git.warnCrlf", label: "Warn if CRLF line separators are about to be committed" },
           {
             kind: "toggle",
@@ -567,9 +600,17 @@ export const VCS_PAGES: PageSpec[] = [
                 k="vcs.git.incomingCheck"
                 label="Explicitly check for incoming commits on remotes"
                 options={INCOMING}
-                hint="Fetches remotes in the background so incoming commits show in the Branches popup. Auto stops after an authentication failure."
+                hint="Fetches the remotes of every repository in the background so incoming commits show in the Branches popup and the Project view. Auto stops checking a repository after it fails, for example on an authentication failure."
               />
             ),
+          },
+          {
+            kind: "number",
+            key: "vcs.git.incomingCheckInterval",
+            label: "Check for incoming commits every",
+            ...L.incomingCheckInterval,
+            integer: true,
+            unit: "min",
           },
         ],
       },

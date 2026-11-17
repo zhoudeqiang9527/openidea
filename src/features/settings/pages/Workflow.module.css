@@ -25,13 +25,15 @@
 /* "[x] Limit history to: [1000] rows" */
 .fontFamily {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .inlineRow {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-height: 28px;
   padding: 2px 6px;
   margin: 0 -6px;
@@ -49,12 +51,12 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px 16px;
+  gap: var(--space-1) var(--space-4);
 }
 .radio {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
 }
 .radio input {
   margin: 0;
@@ -106,7 +108,7 @@
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-0-5);
   padding: 2px 4px;
   border-bottom: 1px solid var(--border);
 }
@@ -161,10 +163,25 @@
 .toolRow {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: var(--h-list-row);
   padding: 0 8px;
   cursor: default;
+}
+.toolRow > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.toolName {
+  flex: 1;
+}
+.toolRow.empty {
+  height: auto;
+  min-height: var(--h-list-row);
+  padding-block: 4px;
+  overflow-wrap: anywhere;
 }
 .toolRow:hover {
   background: var(--bg-tree-hover);
@@ -174,13 +191,14 @@
   background: var(--bg-tree-selected);
 }
 .toolGroup {
+  max-width: 45%;
   color: var(--fg-subtle);
   margin-left: auto;
 }
 .macroField {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
 }
 .macroList {
   display: flex;
@@ -191,7 +209,7 @@
 }
 .macroItem {
   display: flex;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 3px 12px;
   border: none;
   background: none;
@@ -217,7 +235,7 @@
 .toolsLayout *:has(> .alignedRow) {
   display: grid;
   grid-template-columns: minmax(130px, max-content) minmax(0, 1fr);
-  column-gap: 8px;
+  column-gap: var(--space-2);
   align-content: start;
 }
 .toolsLayout *:has(> .alignedRow) > * {

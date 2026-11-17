@@ -24,6 +24,7 @@ const local = {
   appearance: { theme: "dark" },
   editor: { fontSize: 19, tabSize: 8 },
   terminal: { fontSize: 18, shellPath: "/local" },
+  agents: { fitWindowWidth: true, newTaskApprovals: "ask" },
 };
 const remote = {
   keymap: "intellij-linux",
@@ -32,6 +33,7 @@ const remote = {
   appearance: { theme: "light" },
   editor: { fontSize: 13, tabSize: 2 },
   terminal: { fontSize: 13, shellPath: "/remote" },
+  agents: { fitWindowWidth: false, newTaskApprovals: "bypass", mcpServers: { docs: { command: "npx" } } },
 };
 const served = new Set(["settings_get", "settings_set", "project_current"]);
 let invoke: ReturnType<typeof vi.fn>;
@@ -56,6 +58,33 @@ afterEach(() => {
 });
 
 describe("remote client settings", () => {
+  it("routes window reports through the commands advertised by the remote host", async () => {
+    enableRemote({
+      target: { kind: "ssh", config: "test" },
+      root: "/remote",
+      host: "test",
+      os: "linux",
+      commands: ["mcp_set_open_editors", "mcp_set_focused_editor", "mcp_report_problems"],
+    });
+    invoke.mockResolvedValue("null");
+    await call(commands.mcpSetOpenEditors(["/remote/a.txt"]));
+    await call(commands.mcpSetFocusedEditor(null, true));
+    const files = [{ path: "/remote/a.txt", items: [] }];
+    await call(commands.mcpReportProblems(true, files));
+    await call(commands.mcpReportProblems(false, files));
+    const reports = invoke.mock.calls.map(([cmd, args]) => [
+      cmd,
+      (args as { cmd: string }).cmd,
+      JSON.parse((args as { args: string }).args),
+    ]);
+    expect(reports).toEqual([
+      ["remote_invoke", "mcp_set_open_editors", { paths: ["/remote/a.txt"] }],
+      ["remote_invoke", "mcp_set_focused_editor", { editor: null, focused: true }],
+      ["remote_invoke", "mcp_report_problems", { reset: true, files }],
+      ["remote_invoke", "mcp_report_problems", { reset: false, files }],
+    ]);
+  });
+
   it.each([
     { gradle: { dir: "app", projects: [] }, expected: [{ dir: "app", projects: [] }] },
     {
@@ -115,6 +144,9 @@ describe("remote client settings", () => {
     "terminal.env",
     "tools.node",
     "languages.python.interpreter",
+    "agents.newTaskApprovals",
+    "agents.defaults",
+    "agents.mcpServers",
     "keymapExtra",
   ])("preserves routing for host setting %s", (key) => {
     expect(remoteRouting("settings_set", { scope: "project", key }, served)).toBe("remote");
@@ -195,6 +227,7 @@ describe("remote client settings", () => {
       ...local,
       editor: { fontSize: 19, tabSize: 2 },
       terminal: { fontSize: 18, shellPath: "/remote" },
+      agents: { fitWindowWidth: true, newTaskApprovals: "bypass", mcpServers: { docs: { command: "npx" } } },
     });
     expect(invoke).toHaveBeenCalledWith("settings_get_global", {}, undefined);
   });

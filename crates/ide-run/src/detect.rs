@@ -5,8 +5,10 @@
 
 pub(crate) mod cmake;
 mod dotnet;
+mod zig;
 
 use crate::RunConfig;
+use ide_core::project_roots::expand_members;
 use serde_json::Value as Json;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -42,7 +44,7 @@ pub(crate) fn detect_with_profiles(
                     .iter()
                     .any(|name| dir.join(name).join(PyEnv::bin_dir()).join(PyEnv::python_exe()).is_file())
         },
-        detect_python,
+        |dir, out| detect_python(root, dir, out),
         &mut out,
     );
     detect_projects(
@@ -52,6 +54,18 @@ pub(crate) fn detect_with_profiles(
         &mut out,
     );
     detect_projects_matching(root, ruby_project, detect_ruby, &mut out);
+    detect_projects(root, &["rebar.config"], detect_rebar, &mut out);
+    detect_projects(root, &["mix.exs"], detect_mix, &mut out);
+    // A project's own `build.sbt` belongs to the build above it.
+    detect_projects_matching(
+        root,
+        |dir| {
+            dir.join("build.sbt").is_file()
+                && !dir.ancestors().skip(1).take_while(|a| a.starts_with(root)).any(|a| a.join("build.sbt").is_file())
+        },
+        detect_sbt,
+        &mut out,
+    );
     for dir in ide_core::project_roots::discover(root, &["CMakeLists.txt"]) {
         let start = out.len();
         cmake::detect(&dir, if dir == root { profiles } else { None }, &mut out);
@@ -61,7 +75,7 @@ pub(crate) fn detect_with_profiles(
                 config.id = scope.id(&config.id);
                 config.name = scope.name(&config.name);
                 for task in &mut config.extras.before_launch {
-                    if task.kind == "run" {
+                    if matches!(task.kind.as_str(), "run" | "build") && !task.target.is_empty() {
                         task.target = scope.id(&task.target);
                     }
                 }
@@ -69,6 +83,7 @@ pub(crate) fn detect_with_profiles(
             }
         }
     }
+    detect_projects(root, &["build.zig"], zig::detect, &mut out);
     dotnet::detect(root, &mut out);
     detect_projects(root, &["Makefile", "makefile", "GNUmakefile"], detect_make, &mut out);
     detect_projects(root, &["justfile", "Justfile", ".justfile"], detect_just, &mut out);
@@ -213,33 +228,6 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
     ide_core::project_roots::children(dir)
 }
 
-/// Expands workspace member patterns one level deep: `dir`, `dir/*`, `dir/**`.
-fn expand_members(root: &Path, patterns: &[String], marker: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for pattern in patterns {
-        let pattern = pattern.trim().trim_start_matches("./").trim_end_matches('/');
-        if pattern.is_empty() || pattern.starts_with('!') {
-            continue;
-        }
-        let base = pattern.strip_suffix("/**").or_else(|| pattern.strip_suffix("/*"));
-        match base {
-            Some(base) if !base.contains('*') => {
-                dirs.extend(subdirs(&root.join(base)).into_iter().filter(|d| d.join(marker).is_file()))
-            }
-            None if !pattern.contains('*') => {
-                let dir = root.join(pattern);
-                if dir.join(marker).is_file() {
-                    dirs.push(dir);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut seen = HashSet::new();
-    dirs.retain(|d| seen.insert(d.clone()));
-    dirs
-}
-
 fn relative(root: &Path, dir: &Path) -> PathBuf {
     dir.strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| dir.to_path_buf())
 }
@@ -272,33 +260,6 @@ fn push_scripts(pkg: &Json, pm: &str, prefix: Option<&str>, cwd: Option<PathBuf>
     }
 }
 
-fn node_workspace_patterns(root: &Path, pkg: &Json) -> Vec<String> {
-    let mut patterns: Vec<String> = Vec::new();
-    let ws = pkg.get("workspaces");
-    let list = ws.and_then(Json::as_array).or_else(|| ws.and_then(|w| w.get("packages")).and_then(Json::as_array));
-    if let Some(list) = list {
-        patterns.extend(list.iter().filter_map(Json::as_str).map(str::to_owned));
-    }
-    if let Some(yaml) = read(&root.join("pnpm-workspace.yaml")) {
-        let mut in_packages = false;
-        for line in yaml.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if !line.starts_with([' ', '\t', '-']) {
-                in_packages = trimmed.starts_with("packages:");
-                continue;
-            }
-            if in_packages && let Some(item) = trimmed.strip_prefix('-') {
-                let item = item.split(" #").next().unwrap_or_default().trim().trim_matches(['"', '\'']);
-                patterns.push(item.to_owned());
-            }
-        }
-    }
-    patterns
-}
-
 fn detect_node(root: &Path, out: &mut Vec<RunConfig>) {
     let mut covered = HashSet::new();
     let projects =
@@ -314,7 +275,7 @@ fn detect_node(root: &Path, out: &mut Vec<RunConfig>) {
         let rel = relative(root, &dir);
         let label = ide_core::ipc_path::to_ipc(&rel);
         push_scripts(&pkg, pm, (dir != root).then_some(label.as_str()), (dir != root).then_some(rel), out);
-        for member_dir in expand_members(&dir, &node_workspace_patterns(&dir, &pkg), "package.json") {
+        for member_dir in ide_core::project_roots::node_workspace_members(&dir) {
             if !covered.insert(member_dir.clone()) {
                 continue;
             }
@@ -624,7 +585,6 @@ const SPRING_SCAN_FILES: usize = 400;
 /// modules of the build in `build` that apply the Spring Boot plugin:
 /// `java -cp ${classpath} <class>` in the module, the classpath resolved at launch.
 fn spring_boot_apps(root: &Path, build: &Path, out: &mut Vec<RunConfig>) {
-    let mut budget = SPRING_SCAN_FILES;
     let mut modules = vec![build.to_path_buf()];
     let mut level = vec![build.to_path_buf()];
     for _ in 0..ide_core::project_roots::SEARCH_DEPTH {
@@ -632,12 +592,11 @@ fn spring_boot_apps(root: &Path, build: &Path, out: &mut Vec<RunConfig>) {
         modules.extend(level.iter().cloned());
     }
     for module in modules {
-        if budget == 0 {
-            break;
-        }
         if !applies_spring_boot(&module) {
             continue;
         }
+        // A budget per module: a large common library must not starve later app modules.
+        let mut budget = SPRING_SCAN_FILES;
         let module_rel = (module != root).then(|| relative(root, &module).to_string_lossy().replace('\\', "/"));
         for class in spring_boot_classes(&module, &mut budget) {
             let simple = class.rsplit(['.', '$']).next().unwrap_or(&class).to_owned();
@@ -835,6 +794,9 @@ enum PyEnv {
     Runner(&'static str),
     /// A project-local virtualenv directory (relative to root).
     Venv(String),
+    /// A pixi environment directory `.pixi/envs/<env>` (relative to root); tools
+    /// also run as `pixi run …`, the interpreter directly for the debugger.
+    Pixi(String),
     System,
 }
 
@@ -854,7 +816,42 @@ impl PyEnv {
                 return Self::Venv(venv.to_owned());
             }
         }
+        if let Some(env) = Self::pixi_env(root) {
+            return Self::Pixi(env);
+        }
         Self::System
+    }
+
+    /// [`PyEnv::detect`] of `dir`, else of the first of its parents up to `top` that has an
+    /// environment: a Django project in `src/` uses the virtualenv or lock file next to it.
+    /// Paths stay relative to `dir`.
+    fn detect_within(top: &Path, dir: &Path) -> Self {
+        for (up, base) in dir.ancestors().enumerate() {
+            if !base.starts_with(top) {
+                break;
+            }
+            let parent = "../".repeat(up);
+            match Self::detect(base) {
+                Self::System => {}
+                Self::Venv(v) => return Self::Venv(format!("{parent}{v}")),
+                Self::Pixi(v) => return Self::Pixi(format!("{parent}{v}")),
+                runner => return runner,
+            }
+        }
+        Self::System
+    }
+
+    /// The first pixi environment `.pixi/envs/<env>` holding a Python, relative
+    /// to the root, in name order.
+    fn pixi_env(root: &Path) -> Option<String> {
+        let envs = root.join(".pixi/envs");
+        let mut dirs: Vec<_> =
+            std::fs::read_dir(&envs).into_iter().flatten().flatten().map(|e| e.path()).filter(|d| d.is_dir()).collect();
+        dirs.sort_by_key(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        dirs.iter()
+            .find(|d| d.join(Self::python_exe()).is_file() || d.join("bin").join(Self::python_exe()).is_file())
+            .and_then(|d| d.strip_prefix(root).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
     }
 
     fn bin_dir() -> &'static str {
@@ -880,6 +877,18 @@ impl PyEnv {
                 }
             }
             Self::System => (tool.to_owned(), Vec::new()),
+            // A pixi env's executables sit in `bin` (Unix) or `Scripts` (Windows)
+            // like a venv's; else `pixi run` finds the tool.
+            Self::Pixi(v) => {
+                let exe = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_owned() };
+                for bin in ["Scripts", "bin"] {
+                    let rel = format!("{v}/{bin}/{exe}");
+                    if root.join(&rel).is_file() {
+                        return (rel, Vec::new());
+                    }
+                }
+                ("pixi".to_owned(), vec!["run".into(), tool.into()])
+            }
         }
     }
 
@@ -894,7 +903,17 @@ impl PyEnv {
         match self {
             Self::Runner(r) => ((*r).to_owned(), vec!["run".into(), "python".into()]),
             Self::Venv(v) => (format!("{v}/{}/{}", Self::bin_dir(), Self::python_exe()), Vec::new()),
+            Self::Pixi(v) => (Self::pixi_python(v), Vec::new()),
             Self::System => ((if cfg!(windows) { "python" } else { "python3" }).to_owned(), Vec::new()),
+        }
+    }
+
+    /// `<env>/python.exe` (Windows) or `<env>/bin/python` of a pixi environment.
+    fn pixi_python(env: &str) -> String {
+        if cfg!(windows) {
+            format!("{env}/{}", Self::python_exe())
+        } else {
+            format!("{env}/bin/{}", Self::python_exe())
         }
     }
 }
@@ -908,6 +927,9 @@ pub(crate) fn project_python(root: &Path) -> (String, Vec<String>) {
         if root.join(&rel).is_file() {
             return (rel, Vec::new());
         }
+    }
+    if let Some(env) = PyEnv::pixi_env(root) {
+        return (PyEnv::pixi_python(&env), Vec::new());
     }
     PyEnv::detect(root).python()
 }
@@ -940,11 +962,13 @@ fn uses_pytest(root: &Path) -> bool {
         .any(|f| read(&root.join(f)).is_some_and(|s| s.contains("pytest")))
 }
 
-fn detect_python(root: &Path, out: &mut Vec<RunConfig>) {
+/// Python configurations of the project at `root`, a folder of the opened project `top`.
+fn detect_python(top: &Path, root: &Path, out: &mut Vec<RunConfig>) {
     let markers = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "pytest.ini", "tox.ini", "manage.py"];
-    let env = PyEnv::detect(root);
-    // A project virtualenv marks a Python project too (scripts + tests without packaging files).
-    let venv = matches!(env, PyEnv::Venv(_));
+    let env = PyEnv::detect_within(top, root);
+    // A project virtualenv or pixi environment marks a Python project too
+    // (scripts + tests without packaging files).
+    let venv = matches!(env, PyEnv::Venv(_) | PyEnv::Pixi(_));
     if !venv && !markers.iter().any(|m| root.join(m).is_file()) {
         return;
     }
@@ -978,7 +1002,10 @@ fn detect_python(root: &Path, out: &mut Vec<RunConfig>) {
             &["-m", &m],
         ));
     }
-    if uses_pytest(root) || env.has_tool(root, "pytest") {
+    // Only an environment of the folder itself makes it a pytest project: one borrowed from a
+    // parent would give every folder with a `requirements.txt` its own pytest run.
+    let own_pytest = matches!(env, PyEnv::Venv(ref v) if !v.starts_with("../")) && env.has_tool(root, "pytest");
+    if uses_pytest(root) || own_pytest {
         out.push(py_config("pytest".into(), "pytest".into(), "pytest", env.tool(root, "pytest"), &[]).test());
     }
     // After pytest: a project set up for pytest (pytest-django) keeps it as the default test runner.
@@ -1003,10 +1030,15 @@ fn is_composer_event(name: &str) -> bool {
     name.starts_with("pre-") || name.starts_with("post-") || name == "command"
 }
 
-/// The PHPUnit entry point: the project's `vendor/bin/phpunit`, else a global `phpunit`.
-fn phpunit_command(root: &Path) -> String {
-    let bin = if cfg!(windows) { "vendor/bin/phpunit.bat" } else { "vendor/bin/phpunit" };
-    if root.join(bin).is_file() { bin.to_owned() } else { "phpunit".to_owned() }
+/// The PHPUnit entry point: the project's `vendor/bin/pest` or `vendor/bin/phpunit`, else a global `phpunit`.
+fn phpunit_command(root: &Path) -> (String, &'static str) {
+    for (runner, label) in [("pest", "Pest"), ("phpunit", "PHPUnit")] {
+        let bin = format!("vendor/bin/{runner}{}", if cfg!(windows) { ".bat" } else { "" });
+        if root.join(&bin).is_file() {
+            return (bin, label);
+        }
+    }
+    ("phpunit".to_owned(), "PHPUnit")
 }
 
 /// Composer projects (`composer.json`) and PHPUnit suites (`phpunit.xml`, `phpunit.xml.dist`).
@@ -1040,8 +1072,14 @@ fn detect_php(root: &Path, out: &mut Vec<RunConfig>) {
         );
         out.push(if name == "test" { c.test() } else { c });
     }
-    if phpunit_xml.is_some() || requires("phpunit/phpunit") || root.join("vendor/bin/phpunit").is_file() {
-        let mut c = config("phpunit", "PHPUnit", "phpunit", &phpunit_command(root), &[]).test().debug("php-debug");
+    if phpunit_xml.is_some()
+        || requires("phpunit/phpunit")
+        || requires("pestphp/pest")
+        || root.join("vendor/bin/phpunit").is_file()
+        || root.join("vendor/bin/pest").is_file()
+    {
+        let (command, label) = phpunit_command(root);
+        let mut c = config("phpunit", label, "phpunit", &command, &[]).test().debug("php-debug");
         // A configuration file with a non-default name must be passed explicitly.
         let named = phpunit_xml.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned());
         if let Some(file) = named.filter(|f| f == "phpunit.dist.xml") {
@@ -1167,6 +1205,7 @@ fn detect_ruby(root: &Path, out: &mut Vec<RunConfig>) {
             ("ruby".into(), Vec::new()),
             &["bin/rails", "server"],
         );
+        c = c.debug("rdbg");
         c.extras.folder = Some("Rails".into());
         out.push(c);
     }
@@ -1179,12 +1218,15 @@ fn detect_ruby(root: &Path, out: &mut Vec<RunConfig>) {
             if task == "test" || task == "spec" || task.ends_with(":test") || task.ends_with(":spec") {
                 c = c.test();
             }
+            c = c.debug("rdbg");
             c.extras.folder = Some("Rake".into());
             out.push(c);
         }
     }
     if uses_rspec(root) {
-        out.push(ruby_config("rspec".into(), "rspec".into(), "rspec", ruby_tool(root, "rspec"), &[]).test());
+        out.push(
+            ruby_config("rspec".into(), "rspec".into(), "rspec", ruby_tool(root, "rspec"), &[]).test().debug("rdbg"),
+        );
     } else if root.join("test").is_dir() && !out.iter().any(|c| c.id == "rake:test") {
         // Minitest / Test::Unit without a `test` Rake task: load every test file under `test/`.
         let mut args = Vec::new();
@@ -1195,7 +1237,11 @@ fn detect_ruby(root: &Path, out: &mut Vec<RunConfig>) {
         }
         args.extend(["-e".to_owned(), MINITEST_RUNNER.to_owned(), "test".to_owned()]);
         let extra: Vec<&str> = args.iter().map(String::as_str).collect();
-        out.push(ruby_config("minitest".into(), "minitest".into(), "ruby", ruby_tool(root, "ruby"), &extra).test());
+        out.push(
+            ruby_config("minitest".into(), "minitest".into(), "ruby", ruby_tool(root, "ruby"), &extra)
+                .test()
+                .debug("rdbg"),
+        );
     }
 }
 
@@ -1293,6 +1339,46 @@ pub(crate) fn just_recipes(src: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------- godot
+
+// ---------------------------------------------------------------- rebar3 / mix
+
+/// rebar3 (Erlang): the shell with the applications started, the EUnit tests and, with
+/// `*_SUITE.erl` suites, Common Test. A `rebar3` script in the project wins over the PATH.
+fn detect_rebar(root: &Path, out: &mut Vec<RunConfig>) {
+    let rebar = wrapper(root, "rebar3", "rebar3.cmd", "rebar3");
+    out.push(config("rebar3:shell", "rebar3 shell", "rebar3", &rebar, &["shell"]));
+    out.push(config("rebar3:eunit", "rebar3 eunit", "rebar3", &rebar, &["eunit"]).test());
+    let suites = |dir: &Path| {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with("_SUITE.erl"))
+    };
+    let mut apps = subdirs(&root.join("apps")).into_iter().chain(subdirs(&root.join("lib")));
+    if suites(&root.join("test")) || apps.any(|app| suites(&app.join("test"))) {
+        out.push(config("rebar3:ct", "rebar3 ct", "rebar3", &rebar, &["ct"]).test());
+    }
+}
+
+/// Mix (Elixir): the application in IEx (`phx.server` for Phoenix) and its ExUnit tests.
+fn detect_mix(root: &Path, out: &mut Vec<RunConfig>) {
+    let phoenix = read(&root.join("mix.exs")).is_some_and(|src| src.contains("{:phoenix,"));
+    if phoenix {
+        out.push(config("mix:phx.server", "iex -S mix phx.server", "mix", "iex", &["-S", "mix", "phx.server"]));
+    } else {
+        out.push(config("mix:iex", "iex -S mix", "mix", "iex", &["-S", "mix"]));
+    }
+    out.push(config("mix:test", "mix test", "mix", "mix", &["test"]).test());
+}
+
+/// sbt (Scala): `sbt run` and `sbt test` on the build's root project, with the build's
+/// own launcher script when it has one. Other tasks run from the sbt tool window.
+fn detect_sbt(root: &Path, out: &mut Vec<RunConfig>) {
+    let sbt = wrapper(root, "sbt", "sbt.bat", "sbt");
+    out.push(config("sbt:run", "sbt run", "sbt", &sbt, &["run"]));
+    out.push(config("sbt:test", "sbt test", "sbt", &sbt, &["test"]).test());
+}
 
 /// Godot projects (`project.godot`) at the root or one level down: "Godot Project"
 /// runs the main scene (`godot --path .`), debuggable through the editor's adapter.

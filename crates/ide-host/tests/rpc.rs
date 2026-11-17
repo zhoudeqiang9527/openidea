@@ -5,7 +5,7 @@ use ide_host::rpc::{self, ChannelMessage, Dispatcher, EventMessage, Invoke, Serv
 use ide_host::{Host, HostConfig};
 use ide_jsonrpc::{Handler, Peer};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -82,7 +82,9 @@ async fn serves_projects_files_documents_search_and_runs() {
     invoke(&peer, "lsp_resend_diagnostics", json!({})).await.unwrap();
     let files = invoke(&peer, "find_files", json!({"query": "main", "limit": 10})).await.unwrap();
     assert!(files.is_array());
-    for command in ["build_sync", "run_start", "sdk_locate_tools", "notebook_execute", "debug_start"] {
+    for command in
+        ["build_sync", "run_start", "sdk_locate_tools", "notebook_execute", "debug_start", "agent_refresh_models"]
+    {
         let error = invoke(&peer, command, json!({})).await.unwrap_err();
         assert!(error.message.contains("Restricted Mode"), "{command}: {error:?}");
     }
@@ -125,6 +127,12 @@ async fn serves_projects_files_documents_search_and_runs() {
     invoke(&peer, "project_trust_set", json!({"path": project, "trusted": true, "folder": false})).await.unwrap();
     let current = invoke(&peer, "project_current", json!({})).await.unwrap();
     assert_eq!(current["name"], "demo");
+
+    // The built-in web server runs where the project is; the client forwards its port.
+    let root = std::path::PathBuf::from(opened["root"].as_str().unwrap());
+    let url = invoke(&peer, "web_url", json!({ "path": root.join("src/main.py") })).await.unwrap();
+    let url = url.as_str().unwrap();
+    assert!(url.starts_with("http://127.0.0.1:") && url.ends_with("/demo/src/main.py"), "{url}");
 
     let entries = invoke(&peer, "fs_read_dir", json!({ "path": project })).await.unwrap();
     assert!(entries.as_array().unwrap().iter().any(|e| e["name"] == "src"), "{entries}");
@@ -215,9 +223,11 @@ async fn serves_projects_files_documents_search_and_runs() {
     .unwrap();
     assert_eq!(settings["deployment"]["autoUpload"], "always");
     let project_root = dunce::canonicalize(&project).unwrap();
-    assert!(std::fs::read_to_string(ide_core::project_dir::path(&project_root, "settings.toml"))
-        .unwrap()
-        .contains("autoUpload"));
+    assert!(
+        std::fs::read_to_string(ide_core::project_dir::path(&project_root, "settings.toml"))
+            .unwrap()
+            .contains("autoUpload")
+    );
     assert!(!project.join(".openidea").exists());
     invoke(&peer, "vcs_init", json!({ "dir": project })).await.unwrap();
     until("git repository", || project.join(".git").is_dir()).await;
@@ -247,9 +257,9 @@ async fn serves_projects_files_documents_search_and_runs() {
     assert!(std::fs::read_to_string(project.join(".git/info/exclude")).unwrap().contains("/private.ignore-me"));
     let outside = tmp.path().join("outside.ignore-me");
     std::fs::write(&outside, "keep").unwrap();
-    assert!(invoke(&peer, "vcs_add_to_ignore", json!({ "paths": [outside], "destination": "gitignore" }))
-        .await
-        .is_err());
+    assert!(
+        invoke(&peer, "vcs_add_to_ignore", json!({ "paths": [outside], "destination": "gitignore" })).await.is_err()
+    );
 
     // Unknown commands and bad arguments come back as IdeErrors.
     let e = invoke(&peer, "window_minimize", json!({})).await.unwrap_err();
@@ -334,10 +344,12 @@ async fn local_deployment_runs_on_the_project_host() {
         "remote_delete",
         "remote_mkdir",
         "remote_rename",
+        "remote_download_into",
         "db_sources",
         "db_save_sources",
         "db_set_password",
         "db_test",
+        "db_test_tunnel",
         "db_set_ssh_secret",
         "db_trust_ssh_host",
         "db_connected",
@@ -361,6 +373,14 @@ async fn local_deployment_runs_on_the_project_host() {
         "db_table_page",
         "db_apply_edits",
         "db_console_path",
+        "db_consoles",
+        "ssh_test",
+        "ssh_set_secret",
+        "ssh_password_saved",
+        "ssh_needs_secret",
+        "ssh_trust_host",
+        "ssh_connected",
+        "ssh_disconnect",
     ] {
         assert!(dispatcher.commands().contains(&cmd), "missing host command {cmd}");
     }
@@ -369,6 +389,12 @@ async fn local_deployment_runs_on_the_project_host() {
     tokio::spawn(rpc::serve(host, dispatcher, slot, sr, sw));
     let (cr, cw) = tokio::io::split(client_io);
     let peer = Peer::connect(cr, cw, Arc::new(Client::default()));
+    // A remote window's host-key and password remedies reach the server's SSH manager,
+    // the one its deployment / database connections failed in.
+    let trust = invoke(&peer, "ssh_trust_host", json!({"id": "nothing-pending"})).await.unwrap_err();
+    assert!(trust.message.contains("no host key to trust"), "{trust:?}");
+    invoke(&peer, "ssh_set_secret", json!({"id": "deploy", "secret": "pw", "save": false})).await.unwrap();
+    assert_eq!(invoke(&peer, "ssh_connected", json!({})).await.unwrap(), json!([]));
     invoke(&peer, "project_trust_set", json!({"path": project, "trusted": true, "folder": false})).await.unwrap();
     invoke(&peer, "open_project", json!({"path": project})).await.unwrap();
     let deployment = json!({"servers": [{"id":"local", "kind":"local", "rootPath":target}], "defaultServer":"local"});
@@ -449,6 +475,56 @@ async fn properties_conversion_through_remote_dispatch_without_a_remote_host() {
     let reloaded = invoke(&peer, "doc_snapshot", json!({"doc":doc})).await.unwrap();
     assert_eq!(reloaded["text"], "value=你好😀界");
     assert_eq!(reloaded["dirty"], false);
+    invoke(&peer, "close_project", json!({})).await.unwrap();
+    peer.kill();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renames_a_branch_with_the_clients_argument_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(&root).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    git(&["add", "."]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+    git(&["branch", "feature"]);
+    let peer_slot = Arc::new(OnceLock::new());
+    let host = Arc::new(Host::new(HostConfig {
+        config_dir: tmp.path().join("config"),
+        data_dir: tmp.path().join("data"),
+        local_data_dir: tmp.path().join("data"),
+        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
+        syntax: Arc::default(),
+        sink_for: Box::new(|_| Arc::new(ide_core::NullSink)),
+        owner: |w| w,
+        runtime: tokio::runtime::Handle::current(),
+        project_environment: false,
+    }));
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (sr, sw) = tokio::io::split(server_io);
+    tokio::spawn(rpc::serve(host, Dispatcher::standard(), peer_slot, sr, sw));
+    let (cr, cw) = tokio::io::split(client_io);
+    let peer = Peer::connect(cr, cw, Arc::new(Client::default()));
+    invoke(&peer, "open_project", json!({"path": root})).await.unwrap();
+    invoke(&peer, "project_trust_set", json!({"path": root, "trusted": true, "folder": false})).await.unwrap();
+    // The argument names the desktop client sends (`vcsRenameBranch` in src/bindings.ts).
+    invoke(
+        &peer,
+        "vcs_rename_branch",
+        json!({"repo": null, "from": "feature", "to": "renamed", "unsetUpstream": false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        git(&["branch", "--format=%(refname:short)", "--list"]).lines().collect::<Vec<_>>(),
+        ["main", "renamed"]
+    );
     invoke(&peer, "close_project", json!({})).await.unwrap();
     peer.kill();
 }

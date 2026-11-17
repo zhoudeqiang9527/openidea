@@ -22,7 +22,7 @@
 .row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   min-width: 0;
   flex: 1;
   white-space: nowrap;
@@ -112,6 +112,17 @@
 .system {
   color: var(--fg-subtle);
   font-style: italic;
+}
+.link {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--link) 45%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.link:hover {
+  color: var(--link-hover);
+  text-decoration-color: currentColor;
 }
 .titleButton {
   width: 30px;

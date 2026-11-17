@@ -9,11 +9,17 @@ import { phpunitArgs } from "./testing/phpunit";
 import { goTestParts } from "./goArguments";
 import { goBuildType } from "./goTypes";
 import { isWindows } from "./jvmTypes";
+import { typeFor } from "./types";
+import { runTemplate } from "./runTemplates";
+import { appendScriptArgs } from "./scriptArgs";
+import { csharpTargets } from "./csharpTargets";
 
 export type FileRole = "test" | "main" | "script" | null;
 
 /** `django`: a Django project, whose default test module is `tests.py` (elsewhere a script). */
 export function fileRole(relPath: string, content?: string, windows = isWindows(), django = false): FileRole {
+  if (/\.cs$/i.test(relPath) && content && csharpTargets(content).some((target) => target.kind === "test"))
+    return "test";
   const name = relPath.split("/").pop() ?? relPath;
   if (
     /\.(test|spec)\.[cm]?[jt]sx?$/.test(name) ||
@@ -41,6 +47,7 @@ const stem = (p: string) => (p.split("/").pop() ?? p).replace(/\.[^.]+$/, "");
 
 /** Kinds whose test configs can run a file of this extension. */
 function testKinds(relPath: string): string[] {
+  if (/\.cs$/i.test(relPath)) return ["dotnet-test"];
   if (/\.[cm]?[jt]sx?$/.test(relPath)) return ["npm", "deno", "bun"];
   if (/\.py$/.test(relPath)) return ["pytest", "python", "django-test"];
   if (/\.php$/.test(relPath)) return ["phpunit"];
@@ -54,6 +61,8 @@ function testKinds(relPath: string): string[] {
 
 /** The module owning a configuration's targets, relative to the project root. */
 export function configScope(config: RunConfig): string {
+  if (config.kind === "dotnet" || config.kind === "dotnet-test")
+    return dirOf((config.params?.project || "").replace(/\\/g, "/"));
   return (
     config.kind === "go"
       ? (config.params?.module ?? config.module ?? config.cwd ?? "")
@@ -135,9 +144,16 @@ export function projectPython(configs: RunConfig[], relPath?: string): { command
   return null;
 }
 
+/** `python` on Windows (where `python3` is not a command), `python3` elsewhere. */
+function systemPython(): string {
+  return isWindows() ? "python" : "python3";
+}
+
 /**
  * PyCharm runs pytest for a `test_*.py` file even when the project declares no
  * test setup: `python -m pytest`, with the project's interpreter when detected.
+ * The "Edit configuration templates…" › pytest values win over both the
+ * interpreter and the runner arguments, like a template a new config inherits.
  */
 function implicitPytest(relPath: string, configs: RunConfig[]): RunConfig | null {
   if (!relPath.endsWith(".py")) return null;
@@ -146,11 +162,11 @@ function implicitPytest(relPath: string, configs: RunConfig[]): RunConfig | null
     relPath,
   );
   const py = projectPython(owners);
-  return {
+  const base: RunConfig = {
     id: "pytest:implicit",
     name: "pytest",
     kind: "pytest",
-    command: py?.command ?? "python3",
+    command: py?.command ?? systemPython(),
     args: [...(py?.prefix ?? []), "-m", "pytest"],
     cwd: owners[0]?.cwd ?? null,
     module: owners[0]?.module,
@@ -159,6 +175,25 @@ function implicitPytest(relPath: string, configs: RunConfig[]): RunConfig | null
     isTest: true,
     debugAdapter: "debugpy",
   };
+  return applyPytestTemplate(base);
+}
+
+/**
+ * "Edit configuration templates…" › pytest applied to a gutter/context pytest
+ * configuration: its Command and Runner arguments replace the detected
+ * interpreter (`pixi` + `run pytest`, a venv's `pytest`, …) while the file the
+ * context adds stays the target — a target stored on the template itself is
+ * dropped, or the run would execute both it and the file. Without a template
+ * the config is unchanged.
+ */
+function applyPytestTemplate(config: RunConfig): RunConfig {
+  const type = typeFor("pytest");
+  const template = runTemplate("pytest");
+  const params = type && template ? { ...type.defaults, ...template.params, target: "" } : null;
+  if (!type || !params) return config;
+  const line = type.commandLine(params);
+  if (!line) return config;
+  return { ...config, command: line.command, args: line.args };
 }
 
 /**
@@ -181,15 +216,29 @@ export function testBasesFor(relPath: string, configs: RunConfig[]): RunConfig[]
  * File-level test configuration for `relPath` (the closest matching test config,
  * or `base`, narrowed to the file).
  */
-export function testConfigFor(relPath: string, configs: RunConfig[], base?: RunConfig): RunConfig | null {
+export function testConfigFor(
+  relPath: string,
+  configs: RunConfig[],
+  base?: RunConfig,
+  content?: string,
+): RunConfig | null {
   base ??= testBasesFor(relPath, configs)[0];
   if (!base) return null;
   const file = relToCwd(relPath, base);
   switch (base.kind) {
+    case "dotnet-test": {
+      const methods = csharpTargets(content ?? "")
+        .filter((t) => t.kind === "test")
+        .map((t) => t.path.join("."));
+      return methods.length
+        ? derived(base, relPath, {
+            params: { ...base.params, testMethods: JSON.stringify(methods) },
+          })
+        : null;
+    }
     case "npm":
     case "bun": {
-      // `npm run test -- file` works for npm, pnpm, yarn and bun.
-      const args = base.args.includes("--") ? [...base.args, file] : [...base.args, "--", file];
+      const args = appendScriptArgs(base.command, base.args, [file]);
       return derived(base, relPath, { args });
     }
     case "deno":
@@ -347,7 +396,7 @@ function scriptConfigFor(
   };
   if (relPath.endsWith(".py")) {
     // Reuse the project's interpreter (venv / uv / poetry) when detected.
-    const py = projectPython(configs) ?? { command: "python3", prefix: [] };
+    const py = projectPython(configs) ?? { command: systemPython(), prefix: [] };
     const module = pythonModuleRun(relPath, content, configs);
     if (module)
       return {
@@ -381,7 +430,7 @@ export function contextConfig(
   windows = isWindows(),
 ): RunConfig | null {
   const role = fileRole(relPath, content, windows, hasDjangoTests(configs));
-  if (role === "test") return testConfigFor(relPath, configs);
+  if (role === "test") return testConfigFor(relPath, configs, undefined, content);
   if (role === "main") return mainConfigFor(relPath, configs) ?? scriptConfigFor(relPath, configs, windows, content);
   if (role === "script") return scriptConfigFor(relPath, configs, windows, content);
   return null;

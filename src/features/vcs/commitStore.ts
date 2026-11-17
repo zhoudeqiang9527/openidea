@@ -17,6 +17,10 @@ interface CommitState {
   groupByDir: boolean;
   /** Group the changes into Staged / Unstaged instead of one "Changes" group. */
   groupByStaging: boolean;
+  /** With several repositories, a node per repository above their files. */
+  groupByRepo: boolean;
+  /** Keep untracked files in their own group instead of Changes / Unstaged Changes. */
+  showUnversionedSeparately: boolean;
   /** Whether the Git window's Local Changes tab previews the selection's diff. */
   diffPreview: boolean;
   /** Whether the Commit tool window previews the selection's diff beside the changes (#1599). */
@@ -27,6 +31,8 @@ interface CommitState {
   excludedHunks: Map<string, Set<string>>;
   /** Absolute paths selected in the changes tree. */
   selection: string[];
+  /** Keys of the selected tree nodes: which staging side of a partially staged file. */
+  selectionKeys: string[];
   /** Bumped to focus the message field. */
   focusTick: number;
   /** Bumped to open the commit message history popup. */
@@ -52,11 +58,14 @@ export const useCommit = create<CommitState>(() => ({
   runHooks: true,
   groupByDir: readBool("openidea.vcs.groupByDir", false),
   groupByStaging: readBool("openidea.vcs.groupByStaging", false),
+  groupByRepo: readBool("openidea.vcs.groupByRepo", true),
+  showUnversionedSeparately: readBool("openidea.vcs.showUnversionedSeparately", true),
   diffPreview: readBool("openidea.vcs.diffPreview", true),
   commitDiffPreview: readBool("openidea.vcs.commitDiffPreview", false),
   checks: new Map(),
   excludedHunks: new Map(),
   selection: [],
+  selectionKeys: [],
   focusTick: 0,
   historyTick: 0,
   checkProblems: [],
@@ -96,6 +105,24 @@ export function setGroupByStaging(v: boolean) {
   useCommit.setState({ groupByStaging: v });
   try {
     localStorage.setItem("openidea.vcs.groupByStaging", String(v));
+  } catch {
+    // ignore
+  }
+}
+
+export function setGroupByRepo(v: boolean) {
+  useCommit.setState({ groupByRepo: v });
+  try {
+    localStorage.setItem("openidea.vcs.groupByRepo", String(v));
+  } catch {
+    // ignore
+  }
+}
+
+export function setShowUnversionedSeparately(v: boolean) {
+  useCommit.setState({ showUnversionedSeparately: v });
+  try {
+    localStorage.setItem("openidea.vcs.showUnversionedSeparately", String(v));
   } catch {
     // ignore
   }
@@ -280,6 +307,7 @@ export function installPreparedMessage(): () => void {
         checks: new Map(),
         excludedHunks: new Map(),
         selection: [],
+        selectionKeys: [],
         tab: "changes",
         selectedList: null,
         selectedShelf: null,

@@ -4,34 +4,31 @@
  * requests into the `generated-requests.http` scratch and open it.
  */
 import { RangeSet, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
-import { EditorView, GutterMarker, ViewPlugin, gutter, type ViewUpdate } from "@codemirror/view";
+import { EditorView, GutterMarker, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import {
   activeEditor,
-  editorsFor,
+  iconAreaSource,
   intentionProviders,
-  useEditorRegistry,
+  mapLineStart,
   type ContributedIntention,
   type EditorDocContext,
-  type TextEditorHandle,
 } from "@/editor/api";
-import { tx } from "@/platform/i18n";
-import { call, commands, emitLocalIdeEvent, IpcError } from "@/platform/ipc";
-import { ipcPath } from "@/platform/paths";
+import { appendGeneratedRequests } from "../generatedRequests";
+import { call, commands } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { isVirtualUri } from "@/platform/virtualDocs";
 import { gutterIconMarkup, showContextMenu, type MenuItem } from "@/ui";
-import { editorService, notifications, type MenuGroupContext } from "@/workbench/contributions";
+import { notifications, type MenuGroupContext } from "@/workbench/contributions";
 import { springAt, springControllers, type Controller, type Endpoint } from "./endpoints";
-import { appendRequests, bodyLookup, findHost, renderRequest, skeleton, type SourceReader } from "./request";
+import { bodyLookup, findHost, renderRequest, skeleton, type SourceReader } from "./request";
 import { parseSource } from "./source";
 import styles from "../HttpClient.module.css";
 
 export const SPRING_LANGUAGES = new Set(["java", "kotlin"]);
-export const GENERATED_REQUESTS = "generated-requests.http";
 export const GENERATE_REQUEST = "http.generateSpringRequest";
 export const GENERATE_CONTROLLER_REQUESTS = "http.generateSpringControllerRequests";
 
-const reader: SourceReader = {
+export const sourceReader: SourceReader = {
   read: async (path) => {
     try {
       return await call(commands.fsReadText(path));
@@ -39,6 +36,7 @@ const reader: SourceReader = {
       return null;
     }
   },
+  filesNamed: (name) => call(commands.findFilesNamed(name)),
 };
 
 /** One request per endpoint (`paths[i]` picks another path of the mapping). */
@@ -47,54 +45,18 @@ export interface Target {
   path?: string;
 }
 
-async function scratchFile(): Promise<{ path: string; created: boolean }> {
-  const { appDataDir } = await import("@tauri-apps/api/path");
-  // `appDataDir()` is native (`C:\…`): the editor is found by its `/` path.
-  const dir = `${ipcPath(await appDataDir()).replace(/\/+$/, "")}/scratches`;
-  const ignoreExisting = (e: unknown) => {
-    if (!(e instanceof IpcError && e.kind === "alreadyExists")) throw e;
-  };
-  await call(commands.fsCreateDir(dir)).catch(ignoreExisting);
-  const path = `${dir}/${GENERATED_REQUESTS}`;
-  let created = true;
-  await call(commands.fsCreateFile(path)).catch((e) => {
-    ignoreExisting(e);
-    created = false;
-  });
-  return { path, created };
-}
-
-/** The text editor of `path`, once the just opened tab has created it. */
-function editorFor(path: string, timeoutMs = 5000): Promise<TextEditorHandle | null> {
-  const find = () => editorsFor(path).find((x) => x === activeEditor()) ?? editorsFor(path)[0] ?? null;
-  const now = find();
-  if (now) return Promise.resolve(now);
-  return new Promise((resolve) => {
-    const done = (e: TextEditorHandle | null) => {
-      clearTimeout(timer);
-      unsubscribe();
-      resolve(e);
-    };
-    const timer = setTimeout(() => done(null), timeoutMs);
-    const unsubscribe = useEditorRegistry.subscribe(() => {
-      const e = find();
-      if (e) done(e);
-    });
-  });
-}
-
 /** Renders `targets` of the source at `sourcePath`, appends them to the scratch and opens it at the first one. */
 export async function generateRequests(sourcePath: string, text: string, targets: Target[]): Promise<void> {
   if (!targets.length) return;
   try {
     const root = useProject.getState().project?.root ?? null;
     const [host, lookup] = await Promise.all([
-      findHost(sourcePath, root, reader),
+      findHost(sourcePath, root, sourceReader),
       bodyLookup(
         sourcePath,
         parseSource(text),
         targets.map((t) => t.endpoint),
-        reader,
+        sourceReader,
       ),
     ]);
     const blocks = targets.map(({ endpoint, path }) =>
@@ -104,18 +66,7 @@ export async function generateRequests(sourcePath: string, text: string, targets
         body: endpoint.bodyType ? skeleton(endpoint.bodyType, lookup) : undefined,
       }),
     );
-    const file = await scratchFile();
-    if (file.created) emitLocalIdeEvent({ type: "fsChanged", created: [file.path], modified: [], removed: [] });
-    await editorService().openFile(file.path, { focus: true });
-    const e = await editorFor(file.path);
-    if (!e) throw new Error(`${tx("Cannot open file")}: ${file.path}`);
-    const { insert, from, caret } = appendRequests(e.view.state.doc.toString(), blocks);
-    e.view.dispatch({
-      changes: { from, insert },
-      selection: { anchor: caret },
-      effects: EditorView.scrollIntoView(caret, { y: "center" }),
-      userEvent: "input",
-    });
+    await appendGeneratedRequests(blocks);
   } catch (err) {
     notifications().notify({
       level: "error",
@@ -219,7 +170,7 @@ const marksField = StateField.define<Mark[]>({
   update(value, tr) {
     for (const e of tr.effects) if (e.is(setMarks)) return e.value;
     if (!tr.docChanged || !value.length) return value;
-    return value.map((m) => ({ ...m, pos: tr.state.doc.lineAt(tr.changes.mapPos(m.pos, -1)).from }));
+    return value.map((m) => ({ ...m, pos: mapLineStart(tr, m.pos) }));
   },
 });
 
@@ -257,6 +208,7 @@ class SpringMarker extends GutterMarker {
   override toDOM(): Node {
     const el = document.createElement("div");
     el.className = styles.runMarker ?? "";
+    el.dataset.iconSource = "spring";
     el.title = this.mark.title;
     el.setAttribute("role", "button");
     el.setAttribute("aria-label", this.mark.title);
@@ -325,23 +277,23 @@ export function springEditorExtension(ctx: EditorDocContext): Extension {
     marksField,
     detector,
     intentionProviders.of(intentions),
-    gutter({
-      class: `${styles.runGutter} cm-openidea-gutter-spring`,
+    // In the shared icon area, after the run icons.
+    iconAreaSource.of({
+      order: 30,
       markers: (view) =>
         RangeSet.of(
           view.state.field(marksField).map((m) => new SpringMarker(m).range(m.pos)),
           true,
         ),
-      domEventHandlers: {
-        mousedown: (view, block, event) => {
-          const mark = view.state.field(marksField).find((m) => m.pos === block.from);
-          if (!mark || (event as MouseEvent).button !== 0) return false;
-          const el = (event.target as HTMLElement).closest?.(`.${styles.runMarker}`) as HTMLElement | null;
-          const rect = (el ?? (event.target as HTMLElement)).getBoundingClientRect();
-          event.preventDefault();
-          showContextMenu({ x: rect.left, y: rect.bottom + 2 }, mark.items(path, view.state.doc.toString()));
-          return true;
-        },
+      mousedown: (view, block, event) => {
+        if (event.button !== 0) return false;
+        const el = (event.target as HTMLElement).closest?.('[data-icon-source="spring"]') as HTMLElement | null;
+        const mark = el && view.state.field(marksField).find((m) => m.pos === block.from);
+        if (!el || !mark) return false;
+        const rect = el.getBoundingClientRect();
+        event.preventDefault();
+        showContextMenu({ x: rect.left, y: rect.bottom + 2 }, mark.items(path, view.state.doc.toString()));
+        return true;
       },
     }),
   ];

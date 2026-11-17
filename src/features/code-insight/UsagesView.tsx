@@ -66,8 +66,16 @@ export function UsagesTabs() {
   const tabs = useUsages((s) => s.tabs);
   const search = useUsages(activeUsageSearch);
   if (!search) return null;
-  const label = (t: (typeof tabs)[number]) =>
-    t.symbol ? formatMessage(tx("Usages of '{symbol}'"), { symbol: t.symbol }) : tx("Usages");
+  const label = (t: (typeof tabs)[number]) => {
+    if (!t.symbol) return tx("Usages");
+    const text =
+      t.scope === "project"
+        ? tx("Usages of '{symbol}' in Project Files")
+        : t.scope === "libraries"
+          ? tx("Usages of '{symbol}' in Project and Libraries")
+          : tx("Usages of '{symbol}'");
+    return formatMessage(text, { symbol: t.symbol });
+  };
   return (
     <Tabs
       variant="compact"
@@ -77,24 +85,30 @@ export function UsagesTabs() {
         id: String(t.id),
         label: label(t),
         closable: true,
-        icon: t.pinned ? "pin" : undefined,
+        pinned: t.pinned,
       }))}
       activeId={String(search.id)}
       onSelect={(id) => useUsages.setState({ active: Number(id) })}
       onClose={(id) => closeUsageTab(Number(id))}
+      onTogglePin={(id) => {
+        const t = tabs.find((x) => x.id === Number(id));
+        if (t) pinUsageTab(t.id, !t.pinned);
+      }}
       onContextMenu={(id, e) => {
         const t = tabs.find((x) => x.id === Number(id));
         if (!t) return;
+        // IDEA's content tab menu.
         showContextMenu(e, [
-          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinUsageTab(t.id, !t.pinned) },
-          { kind: "separator" },
           { id: "close", label: "Close Tab", run: () => closeUsageTab(t.id) },
+          { id: "closeAll", label: "Close All Tabs", run: () => tabs.forEach((o) => closeUsageTab(o.id)) },
           {
             id: "closeOthers",
             label: "Close Other Tabs",
             disabled: tabs.length < 2,
             run: () => tabs.forEach((o) => o.id !== t.id && closeUsageTab(o.id)),
           },
+          { kind: "separator" },
+          { id: "pin", label: t.pinned ? "Unpin Tab" : "Pin Tab", run: () => pinUsageTab(t.id, !t.pinned) },
         ]);
       }}
     />
@@ -251,7 +265,7 @@ export function UsagesView() {
     <div className={styles.view}>
       <div className={styles.toolbar} role="toolbar" aria-orientation="vertical" aria-label={tx("Usages actions")}>
         <IconButton
-          icon="rerun"
+          icon="refresh"
           title={tx("Rerun Find Usages")}
           size="small"
           iconSize={16}
@@ -268,11 +282,21 @@ export function UsagesView() {
       </div>
       <div className={styles.body} onKeyDown={onKeyDown}>
         <UsageAccessFilter items={allUsages} />
+        {!search.loading && !search.error && search.scope === "project" && (
+          <div className={styles.summary}>
+            <T>Usages in Project Files</T>
+            {search.searchLibraries && (
+              <button type="button" className={styles.link} onClick={() => search.searchLibraries?.()}>
+                {tx("Search in Project and Libraries")}
+              </button>
+            )}
+          </div>
+        )}
         {(search.loading || search.error) && (
           <div className={styles.summary} role="status" aria-live="polite">
             {search.loading ? (
               <>
-                <Spinner size={12} />{" "}
+                <Spinner size={16} variant="spokes" />{" "}
                 {search.symbol
                   ? formatMessage(tx("Searching for usages of '{symbol}'"), { symbol: search.symbol })
                   : tx("Searching for usages")}
@@ -379,7 +403,7 @@ function UsagesSplit({ preview, children }: { preview: ReactNode; children: Reac
   const show = useUsagesOptions((s) => s.preview);
   if (!show) return children;
   return (
-    <SplitGroup orientation="horizontal" id="usages-preview-split">
+    <SplitGroup orientation="horizontal" id="usages-preview-split" storageKey="openidea.usages.previewSplit">
       <SplitPanel id="usages" minSize={160} className={styles.panel}>
         {children}
       </SplitPanel>

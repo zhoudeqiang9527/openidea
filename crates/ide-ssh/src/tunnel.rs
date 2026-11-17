@@ -1,5 +1,6 @@
 //! Local port forwarding: a listener on 127.0.0.1 whose connections are
-//! forwarded through `direct-tcpip` channels of a [`Session`].
+//! forwarded through `direct-tcpip` channels of a [`Session`], or each to the
+//! stdin / stdout of a command run on the SSH host.
 
 use crate::session::Session;
 use ide_core::{IdeError, IdeResult, error::ErrorKind};
@@ -40,7 +41,17 @@ impl Tunnel {
             None => TcpListener::bind(("127.0.0.1", 0)).await?,
         };
         let local = listener.local_addr()?.port();
-        let accept = tokio::spawn(forward(listener, session.clone(), host.to_owned(), port));
+        let target = Target::Tcp(host.to_owned(), port);
+        let accept = tokio::spawn(forward(listener, session.clone(), target));
+        Ok(Tunnel { port: local, session, accept })
+    }
+
+    /// Listens on a free local port; each connection runs `command` on the SSH host and talks
+    /// to its stdin / stdout (`docker system dial-stdio`, as the Docker CLI's `ssh://` does).
+    pub async fn command(session: Arc<Session>, command: &str) -> IdeResult<Tunnel> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let local = listener.local_addr()?.port();
+        let accept = tokio::spawn(forward(listener, session.clone(), Target::Command(command.to_owned())));
         Ok(Tunnel { port: local, session, accept })
     }
 
@@ -60,17 +71,34 @@ impl Drop for Tunnel {
     }
 }
 
-async fn forward(listener: TcpListener, session: Arc<Session>, host: String, port: u16) {
+/// Where a tunnel's connections go on the SSH side.
+enum Target {
+    Tcp(String, u16),
+    Command(String),
+}
+
+async fn forward(listener: TcpListener, session: Arc<Session>, target: Target) {
+    let target = Arc::new(target);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((mut socket, _)) = listener.accept().await else { return };
+        let accepted = tokio::select! {
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((mut socket, _)) = accepted else { return };
         let session = session.clone();
-        let host = host.clone();
-        tokio::spawn(async move {
-            match session.direct_tcpip(&host, port).await {
-                Ok(mut stream) => {
-                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
-                }
-                Err(e) => tracing::warn!("SSH tunnel: cannot open a channel to {host}:{port}: {e}"),
+        let target = target.clone();
+        connections.spawn(async move {
+            let stream = match &*target {
+                Target::Tcp(host, port) => session.direct_tcpip(host, *port).await.map_err(|e| {
+                    tracing::warn!("SSH tunnel: cannot open a channel to {host}:{port}: {e}");
+                }),
+                Target::Command(command) => session.exec_stream(command).await.map_err(|e| {
+                    tracing::warn!("SSH tunnel: cannot run `{command}`: {e}");
+                }),
+            };
+            if let Ok(mut stream) = stream {
+                let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
             }
         });
     }

@@ -1,7 +1,7 @@
 /**
  * The in-page Settings dialog and its built-in pages load when the dialog first
- * opens: on the desktop Settings use their own window, so the main window rarely
- * needs them.
+ * opens: on the desktop Settings use their own window by default, so the main
+ * window rarely needs them.
  */
 import { lazyComponent } from "@/ui";
 import { useSettingsDialog } from "../model/staging";
@@ -21,8 +21,16 @@ export function unloadBuiltinPages() {
 }
 
 const Dialog = lazyComponent(() => import("./SettingsDialog").then((m) => m.SettingsDialog));
+const ProjectStructure = lazyComponent(() =>
+  import("../languages/ProjectStructurePage").then((m) => m.ProjectStructureDialog),
+);
 
 export function LazySettingsDialog() {
   const open = useSettingsDialog((s) => s.open);
   return open ? <Dialog /> : null;
+}
+
+export function LazyProjectStructureDialog() {
+  const open = useSettingsDialog((s) => s.projectStructureOpen);
+  return open ? <ProjectStructure /> : null;
 }

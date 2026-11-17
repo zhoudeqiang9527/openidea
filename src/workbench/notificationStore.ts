@@ -1,7 +1,8 @@
 /** Notification center: balloons + history, backing `NotificationService`. */
 import type { ReactNode } from "react";
 import { create } from "zustand";
-import { call, commands, onIdeEvent } from "@/platform/ipc";
+import { call, commands, isTauri, onIdeEvent } from "@/platform/ipc";
+import { buildToolRecovery } from "@/platform/buildToolRecovery";
 import { txTemplate } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
 import type { NotificationService } from "./contributions";
@@ -17,6 +18,8 @@ export interface IdeNotification {
   actions?: Array<{ label: string; run: () => void }>;
   time: number;
   read: boolean;
+  /** Text shown as written (see `NotificationService.notify`). */
+  verbatim?: boolean;
   /** Currently shown as a balloon. */
   balloon: boolean;
   sticky: boolean;
@@ -34,6 +37,7 @@ export const NOTIFICATION_GROUPS: ReadonlyArray<{ id: string; title: string }> =
   { id: "tools", title: "External Tools" },
   { id: "search", title: "Find in Files" },
   { id: "plugins", title: "Plugins" },
+  { id: "terminal", title: "Terminal" },
   { id: "updates", title: "IDE Updates" },
   { id: "distractionFree", title: "Distraction Free Mode" },
 ];
@@ -127,7 +131,8 @@ export function notify(n: Parameters<NotificationService["notify"]>[0]): number 
   const id = ++seq;
   const group = groupOf(n);
   const prefs = notificationPrefs(group);
-  const balloon = prefs.balloons && prefs.display !== "none";
+  // The answer to a command the user ran is not a notification they opted out of.
+  const balloon = n.userInitiated === true || (prefs.balloons && prefs.display !== "none");
   const sticky = prefs.display === "sticky" || (n.sticky ?? BALLOON_TIMEOUT[n.level] === null);
   // Neither shown nor listed: dropped, as IDEA's "No popup" + no log.
   if (!balloon && !prefs.log) return id;
@@ -138,6 +143,7 @@ export function notify(n: Parameters<NotificationService["notify"]>[0]): number 
     title: n.title,
     body: n.body,
     actions: n.actions,
+    verbatim: n.verbatim,
     time: Date.now(),
     read: false,
     balloon,
@@ -149,7 +155,16 @@ export function notify(n: Parameters<NotificationService["notify"]>[0]): number 
     const rest = n.key ? s.items.filter((x) => x.key !== n.key) : s.items;
     return { items: [item, ...rest].slice(0, MAX_HISTORY) };
   });
-  if (balloon && prefs.sound) playSound();
+  // OS toast owns the chime when system notifications are on and the app is backgrounded.
+  const systemOn = useProject.getState().settings?.notifications?.systemNotifications !== false;
+  const backgrounded = typeof document !== "undefined" && !document.hasFocus();
+  if (balloon && prefs.sound && !n.silent && !(systemOn && backgrounded)) playSound();
+  if (balloon && isTauri()) {
+    // In the UI language, as the balloon shows it; a plugin's own text stays as written.
+    const shown = (text: string) => (n.verbatim ? text : txTemplate(text));
+    const plain = typeof n.body === "string" ? shown(n.body) : "";
+    void call(commands.showSystemNotification(shown(n.title), plain)).catch(() => {});
+  }
   return id;
 }
 
@@ -180,12 +195,10 @@ export function clearProjectNotifications() {
   useNotifications.setState((s) => ({ items: s.items.filter((x) => x.group === "updates") }));
 }
 
-/** The list was seen: everything is read and no longer shown as a balloon. */
+/** The list was seen: its entries are read; unlogged balloons were not shown there. */
 export function markAllNotificationsRead() {
   useNotifications.setState((s) => ({
-    items: s.items
-      .filter((x) => x.logged)
-      .map((x) => (x.read && !x.balloon ? x : { ...x, read: true, balloon: false })),
+    items: s.items.map((x) => (!x.logged || (x.read && !x.balloon) ? x : { ...x, read: true, balloon: false })),
   }));
 }
 
@@ -198,6 +211,14 @@ export function installNotifyEvents(): () => void {
   return onIdeEvent(
     "notify",
     // Backend text may carry values (paths, names); `{name}` catalog templates translate it.
-    (e) => void notify({ level: e.level, title: txTemplate(e.title), body: e.body ? txTemplate(e.body) : undefined }),
+    (e) => {
+      const recovery = e.body ? buildToolRecovery(e.body) : undefined;
+      void notify({
+        level: e.level,
+        title: txTemplate(e.title),
+        ...recovery,
+        body: recovery ? txTemplate(recovery.body) : undefined,
+      });
+    },
   );
 }
