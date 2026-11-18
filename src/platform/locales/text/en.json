@@ -2373,5 +2373,8 @@
   "Install IDE Copy": "Install IDE Copy",
   "Not installed:": "Not installed:",
   "Additional servers": "Additional servers",
-  "Run alongside the one above": "Run alongside the one above"
+  "Run alongside the one above": "Run alongside the one above",
+  "Windows integration": "Windows integration",
+  "Add OpenIDEA to the Windows context menu": "Add OpenIDEA to the Windows context menu",
+  "Could not update the context menu": "Could not update the context menu"
 }

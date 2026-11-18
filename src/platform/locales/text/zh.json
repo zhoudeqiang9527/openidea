@@ -8747,5 +8747,8 @@
   "Install IDE Copy": "安装到 IDE",
   "Not installed:": "未安装：",
   "Additional servers": "附加服务器",
-  "Run alongside the one above": "与上面选中的服务器同时运行"
+  "Run alongside the one above": "与上面选中的服务器同时运行",
+  "Windows integration": "Windows 集成",
+  "Add OpenIDEA to the Windows context menu": "将 OpenIDEA 添加到 Windows 右键菜单",
+  "Could not update the context menu": "无法更新右键菜单"
 }

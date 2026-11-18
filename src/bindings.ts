@@ -142,6 +142,7 @@ export const commands = {
 	appCliInstall: () => typedError<CliInstallation, IdeError>(__TAURI_INVOKE("app_cli_install")),
 	/**  Removes the installed `openidea` command; returns the links removed. */
 	appCliUninstall: () => typedError<IpcPath[], IdeError>(__TAURI_INVOKE("app_cli_uninstall")),
+	appContextMenu: (enabled: boolean | null) => typedError<boolean, IdeError>(__TAURI_INVOKE("app_context_menu", { enabled })),
 	appInfo: () => __TAURI_INVOKE<AppInfo>("app_info"),
 	/**
 	 *  Downloads and installs the available update, streaming progress to `on_progress`.

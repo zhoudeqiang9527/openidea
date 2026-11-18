@@ -53,6 +53,7 @@ app_cancel_quit                              always             desktop      bin
 app_check_update                             always             desktop      bindings async
 app_cli_install                              always             desktop      bindings async
 app_cli_uninstall                            always             desktop      bindings async
+app_context_menu                             always             desktop      bindings async
 app_info                                     always             desktop      bindings sync
 app_install_update                           always             desktop      bindings async
 app_log_location                             always             desktop      bindings sync

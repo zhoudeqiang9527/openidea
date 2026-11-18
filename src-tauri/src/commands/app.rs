@@ -402,8 +402,62 @@ pub(crate) async fn project_trust_remove_location(window: Window, path: PathBuf)
     Ok(())
 }
 
+#[cfg(windows)]
+fn context_menu(enabled: Option<bool>) -> IdeResult<bool> {
+    use winreg::{RegKey, enums::*};
+    let root = RegKey::predef(HKEY_CURRENT_USER);
+    let exe = std::env::current_exe().map_err(|e| IdeError::internal(e.to_string()))?;
+    let command = format!("\"{}\" \"%1\"", exe.display());
+    let paths = [
+        r"Software\Classes\*\shell\OpenIDEA",
+        r"Software\Classes\Directory\shell\OpenIDEA",
+        r"Software\Classes\Directory\Background\shell\OpenIDEA",
+    ];
+    if let Some(enable) = enabled {
+        for path in paths {
+            if enable {
+                let (key, _) = root.create_subkey(path).map_err(|e| IdeError::internal(e.to_string()))?;
+                key.set_value("", &"Open with OpenIDEA")
+                    .and_then(|_| key.set_value("Icon", &exe.to_string_lossy().as_ref()))
+                    .map_err(|e| IdeError::internal(e.to_string()))?;
+                let (sub, _) = key.create_subkey("command").map_err(|e| IdeError::internal(e.to_string()))?;
+                let value = if path.contains("Background") { command.replace("%1", "%V") } else { command.clone() };
+                sub.set_value("", &value).map_err(|e| IdeError::internal(e.to_string()))?;
+            } else if let Err(e) = root.delete_subkey_all(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(IdeError::internal(e.to_string()));
+                }
+            }
+        }
+    }
+    Ok(paths.iter().all(|path| {
+        let expected = if path.contains("Background") { command.replace("%1", "%V") } else { command.clone() };
+        root.open_subkey(format!(r"{}\command", path))
+            .and_then(|k| k.get_value::<String, _>(""))
+            .is_ok_and(|v| v == expected)
+    }))
+}
+
+#[desktop_command(trust = always)]
+#[tauri::command]
+#[specta::specta]
+pub async fn app_context_menu(enabled: Option<bool>) -> IdeResult<bool> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || context_menu(enabled))
+            .await
+            .map_err(|e| IdeError::internal(e.to_string()))?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Ok(false)
+    }
+}
+
 ide_command::desktop_domain!(
     app_info,
+    app_context_menu,
     languages,
     light_edit_open,
     light_edit_open_untitled,

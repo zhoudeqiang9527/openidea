@@ -540,6 +540,55 @@ const OPEN_IN: Array<{ value: OpenProjectIn; label: string }> = [
   { value: "ask", label: "Ask" },
 ];
 
+function ContextMenuRow() {
+  const os = usePlatform((s) => s.os);
+  const [checked, setChecked] = useState(false);
+  const [busy, setBusy] = useState(true);
+  useEffect(() => {
+    if (os !== "windows" || !isTauri()) return;
+    void call(commands.appContextMenu(null))
+      .then(setChecked)
+      .catch((e) => {
+        notifications().notify({
+          level: "error",
+          title: "Could not update the context menu",
+          body: String(e),
+          key: "app.contextMenu",
+        });
+      })
+      .finally(() => setBusy(false));
+  }, [os]);
+  if (os !== "windows" || !isTauri()) return null;
+  const change = async (value: boolean) => {
+    setBusy(true);
+    try {
+      setChecked(await call(commands.appContextMenu(value)));
+    } catch (e) {
+      notifications().notify({
+        level: "error",
+        title: "Could not update the context menu",
+        body: String(e),
+        key: "app.contextMenu",
+      });
+      try {
+        setChecked(await call(commands.appContextMenu(null)));
+      } catch {
+        /* Keep the last known state. */
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Checkbox
+      checked={checked}
+      disabled={busy}
+      onChange={(value) => void change(value)}
+      label="Add OpenIDEA to the Windows context menu"
+    />
+  );
+}
+
 function OpenProjectInRow() {
   const [value, set] = useSetting<OpenProjectIn>("general.openProjectIn");
   const name = useId();
@@ -985,6 +1034,10 @@ export const BEHAVIOR_PAGES: PageSpec[] = [
           },
           { kind: "custom", label: "Default directory", component: DefaultDirectoryRow },
         ],
+      },
+      {
+        title: "Windows integration",
+        options: [{ kind: "custom", label: "Add OpenIDEA to the Windows context menu", component: ContextMenuRow }],
       },
       {
         title: "Caches",
