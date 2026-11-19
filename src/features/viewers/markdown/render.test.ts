@@ -6,6 +6,7 @@ import {
   previewOffsetForLine,
   renderMarkdown,
   resolveLink,
+  sourceLineForPreviewOffset,
   slugify,
 } from "./render";
 
@@ -261,6 +262,17 @@ describe("markdown preview rendering", () => {
     expect(previewOffsetForLine(blocks, 10, 400)).toBe(100);
     expect(previewOffsetForLine(blocks, 10.5, 400)).toBe(250);
     expect(previewOffsetForLine([], 3, 400)).toBe(0);
+  });
+
+  it("maps preview scrolling to source lines inside and after blocks", () => {
+    const blocks = [
+      { line: 0, top: 0 },
+      { line: 10, top: 100 },
+    ];
+    expect(sourceLineForPreviewOffset(blocks, 50, 400, 40)).toBe(5);
+    expect(sourceLineForPreviewOffset(blocks, 250, 400, 40)).toBe(25);
+    expect(sourceLineForPreviewOffset(blocks, 900, 400, 40)).toBe(39);
+    expect(sourceLineForPreviewOffset([], 50, 400, 40)).toBe(0);
   });
 
   it("finds the block at the top of a scrolled preview", () => {

@@ -253,3 +253,21 @@ export function previewLineAtOffset(blocks: ReadonlyArray<{ line: number; top: n
   }
   return line;
 }
+
+/** Inverse of previewOffsetForLine, for scrolling the source from the preview. */
+export function sourceLineForPreviewOffset(
+  blocks: ReadonlyArray<{ line: number; top: number }>,
+  offset: number,
+  end: number,
+  lineCount: number,
+): number {
+  if (!blocks.length) return 0;
+  let i = 0;
+  while (i + 1 < blocks.length && blocks[i + 1]!.top <= offset) i++;
+  const a = blocks[i]!;
+  const b = blocks[i + 1];
+  const nextTop = b?.top ?? end;
+  const nextLine = b?.line ?? lineCount;
+  const fraction = Math.max(0, Math.min(1, (offset - a.top) / Math.max(1, nextTop - a.top)));
+  return Math.min(lineCount - 1, Math.max(0, Math.floor(a.line + fraction * (nextLine - a.line))));
+}

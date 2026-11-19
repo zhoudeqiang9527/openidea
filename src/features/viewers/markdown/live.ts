@@ -53,6 +53,20 @@ export const useLiveMarkdown = create<Record<string, LiveMarkdown | undefined>>(
 const TEXT_DELAY = 120;
 const setPreviewSelectionEffect = StateEffect.define<string>();
 const previewSelectionMark = Decoration.mark({ class: "cm-selectionMatch" });
+const previewDrivenScroll = new WeakMap<EditorView, number>();
+
+/** Scroll the editor in the same pane without moving its caret. */
+export function scrollEditorFromPreview(path: string, root: HTMLElement, line: number) {
+  const pane = root.closest("[data-pane-id]");
+  const editors = [...useEditorRegistry.getState().editors].filter((ed) => ed.ctx.path === path);
+  const match = (pane ? editors.find((ed) => pane.contains(ed.view.dom)) : undefined) ?? editors[0];
+  if (!match) return;
+  const view = match.view;
+  const sourceLine = view.state.doc.line(Math.min(Math.max(1, line + 1), view.state.doc.lines));
+  const target = view.lineBlockAt(sourceLine.from).top;
+  view.scrollDOM.scrollTop = target;
+  previewDrivenScroll.set(view, view.scrollDOM.scrollTop);
+}
 
 function publish(path: string, patch: Partial<LiveMarkdown>) {
   useLiveMarkdown.setState((s) => {
@@ -167,6 +181,9 @@ function livePlugin(path: string) {
       private previewSel = "";
       private unsubscribe: () => void;
       private readonly onScroll = () => {
+        const expected = previewDrivenScroll.get(this.view);
+        previewDrivenScroll.delete(this.view);
+        if (expected !== undefined && Math.abs(this.view.scrollDOM.scrollTop - expected) < 1) return;
         if (this.frame) return;
         this.frame = requestAnimationFrame(() => {
           this.frame = 0;

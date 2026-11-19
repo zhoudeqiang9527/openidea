@@ -38,7 +38,13 @@ import {
   selectionMatchesInNode,
   setPreviewHighlight,
 } from "./highlight";
-import { publishPreviewSelection, publishPreviewTop, stepMarkdownPreviewFontZoom, useLiveMarkdown } from "./live";
+import {
+  publishPreviewSelection,
+  publishPreviewTop,
+  scrollEditorFromPreview,
+  stepMarkdownPreviewFontZoom,
+  useLiveMarkdown,
+} from "./live";
 import { subscribeTheme, themeKey } from "@/platform/themeWatch";
 import { hasMermaid, MERMAID_SELECTOR, renderMermaidIn } from "./mermaid";
 import { modeOf, useMarkdownModes } from "./modes";
@@ -48,6 +54,7 @@ import {
   previewLineAtOffset,
   previewOffsetForLine,
   renderMarkdown,
+  sourceLineForPreviewOffset,
   resolveLink,
   slugify,
 } from "./render";
@@ -132,6 +139,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   /** The offset a mount restore clamped short of (content not drawn yet), retried on the next settle. */
   const restoreRetry = useRef<number | null>(null);
   const scrollFrame = useRef(0);
+  const syncedPreviewTop = useRef<number | null>(null);
   /** `<details>` the reader opened or closed, by position: each edit re-renders them as written. */
   const toggled = useRef(new Map<number, boolean>());
 
@@ -222,6 +230,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
     const root = ref.current;
     if (!root || !sync) return;
     root.scrollTop = topLine <= 0 ? 0 : previewOffsetForLine(blocksOf(root), topLine, root.scrollHeight);
+    syncedPreviewTop.current = root.scrollTop;
   }, [html, topLine, scrollSeq, sync, diagramsDrawn, fontZoom, fontSize]);
 
   // The preview's own scroll offset: tab switches and mode toggles unmount the
@@ -234,10 +243,26 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
       // A clamped restore keeps the saved offset until it is applied in full.
       if (restoreRetry.current !== null && Math.abs(root.scrollTop - (scrolledTo.current ?? -1)) < 1) return;
       publishPreviewTop(path, root.scrollTop);
+      if (sync) {
+        const expected = syncedPreviewTop.current;
+        syncedPreviewTop.current = null;
+        if (expected === null || Math.abs(root.scrollTop - expected) >= 1) {
+          scrollEditorFromPreview(
+            path,
+            root,
+            sourceLineForPreviewOffset(
+              blocksOf(root),
+              root.scrollTop,
+              root.scrollHeight,
+              (text ?? "").split("\n").length,
+            ),
+          );
+        }
+      }
     };
     root.addEventListener("scroll", onScroll, { passive: true });
     return () => root.removeEventListener("scroll", onScroll);
-  }, [path]);
+  }, [path, sync, text]);
 
   // Restore it on mount; in split mode the sync effect positions the preview.
   useLayoutEffect(() => {
